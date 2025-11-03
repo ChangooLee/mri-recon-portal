@@ -87,6 +87,12 @@ services:
     build:
       context: ./worker
       dockerfile: Dockerfile
+    deploy:
+      resources:
+        limits:
+          memory: 8G  # 대용량 메쉬 처리용 메모리 증가
+        reservations:
+          memory: 4G
     environment:
       SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}

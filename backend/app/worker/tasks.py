@@ -22,10 +22,11 @@ celery_app.conf.task_routes = {
 }
 
 
-@celery_app.task(name="app.worker.tasks.process_reconstruction")
-def process_reconstruction(reconstruction_id: str):
+@celery_app.task(name="app.worker.tasks.process_reconstruction", bind=True, max_retries=0)
+def process_reconstruction(self, reconstruction_id: str):
     """DICOM 파일을 3D 메쉬로 변환하는 태스크"""
     db = SessionLocal()
+    reconstruction = None
     try:
         reconstruction = db.query(Reconstruction).filter(
             Reconstruction.id == reconstruction_id
@@ -47,16 +48,21 @@ def process_reconstruction(reconstruction_id: str):
             reconstruction.error_message = None
         else:
             reconstruction.status = "failed"
-            reconstruction.error_message = result.get("error", "Unknown error")
+            reconstruction.error_message = result.get("message", result.get("error", "Unknown error"))
         
         db.commit()
         return result
         
     except Exception as e:
+        import traceback
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
         if reconstruction:
-            reconstruction.status = "failed"
-            reconstruction.error_message = str(e)
-            db.commit()
+            try:
+                reconstruction.status = "failed"
+                reconstruction.error_message = error_msg[:500]  # 에러 메시지 길이 제한
+                db.commit()
+            except Exception as db_error:
+                print(f"Failed to update reconstruction status: {db_error}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()

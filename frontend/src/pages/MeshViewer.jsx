@@ -1,236 +1,164 @@
-import React, { useEffect, useRef, useState, Suspense, useMemo } from 'react'
+import React, { useEffect, useRef, useState, Suspense } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../services/auth'
 import api from '../services/api'
-import { Canvas } from '@react-three/fiber'
-import { OrbitControls, PerspectiveCamera, useGLTF, Html } from '@react-three/drei'
+import { Canvas, useThree } from '@react-three/fiber'
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei'
 import * as THREE from 'three'
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+// @ts-ignore - meshopt_decoder 모듈
+import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js'
 
-// Draco 로더 설정 (압축된 GLB 디코딩용)
-const dracoLoader = new DRACOLoader()
-dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/')
-dracoLoader.setDecoderConfig({ type: 'js' })
-
-// GLTFLoader에 Draco 로더 설정
+// 로더/디코더 준비 (Draco+Meshopt, 워커 사전 로드)
 const gltfLoader = new GLTFLoader()
-gltfLoader.setDRACOLoader(dracoLoader)
+const draco = new DRACOLoader()
+draco.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/')
+draco.setDecoderConfig({ type: 'wasm' })
+draco.setWorkerLimit(2)
+draco.preload() // 워커/WASM 사전 로드
+gltfLoader.setDRACOLoader(draco)
+gltfLoader.setMeshoptDecoder(MeshoptDecoder)
+gltfLoader.setCrossOrigin('anonymous')
 
-function Model({ url, onProgress, onLoaded }) {
+// fitToView 함수: 원점·스케일 정확히 맞추기
+function fitToView(root, camera, controls, opts = { targetSize: 5 }) {
+  root.updateMatrixWorld(true)
+
+  // pivot 그룹에 모델을 넣고 pivot을 이동/스케일
+  const pivot = new THREE.Group()
+  pivot.add(root)
+
+  // 초기 박스/단위 추정
+  const box = new THREE.Box3().setFromObject(pivot)
+  const size = box.getSize(new THREE.Vector3())
+  const center = box.getCenter(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z)
+
+  // mm → m 추정(필요 시만): 너무 크면 1/1000 스케일
+  let unitScale = 1
+  if (maxDim > 1000) unitScale = 0.001
+
+  // 원하는 크기(targetSize)에 맞게 스케일
+  const scale = (opts.targetSize ?? 5) / (maxDim * unitScale || 1)
+  pivot.scale.setScalar(scale * unitScale)
+
+  // 스케일 후 다시 중심 맞추기
+  pivot.updateMatrixWorld(true)
+  const box2 = new THREE.Box3().setFromObject(pivot)
+  const center2 = box2.getCenter(new THREE.Vector3())
+  pivot.position.sub(center2) // (0,0,0)로 이동
+
+  // 카메라 맞추기
+  const size2 = box2.getSize(new THREE.Vector3())
+  const maxDim2 = Math.max(size2.x, size2.y, size2.z)
+  const fov = THREE.MathUtils.degToRad(camera.fov)
+  const dist = maxDim2 / (2 * Math.tan(fov / 2))
+  const offset = 1.3
+
+  const viewDir = new THREE.Vector3(1, 1, 1).normalize()
+  camera.position.copy(center2).addScaledVector(viewDir, dist * offset)
+  camera.near = dist / 100
+  camera.far = dist * 100
+  camera.updateProjectionMatrix()
+
+  controls.target.copy(new THREE.Vector3(0, 0, 0))
+  controls.minDistance = dist / 10
+  controls.maxDistance = dist * 10
+  controls.update()
+
+  return { pivot, box: box2, maxDim: maxDim2 }
+}
+
+function Model({ url, onProgress, onLoaded, controlsRef, cameraRef }) {
   const [scene, setScene] = useState(null)
-  const [loadingProgress, setLoadingProgress] = useState(0)
   
   useEffect(() => {
-    // 직접 fetch를 사용하여 progress 추적
-    let abortController = new AbortController()
+    let isAborted = false
     
-    const loadModel = async () => {
-      try {
-        const response = await fetch(url, { signal: abortController.signal })
-        const total = parseInt(response.headers.get('Content-Length') || '0')
-        const reader = response.body.getReader()
-        const chunks = []
-        let loaded = 0
-        let estimatedTotal = total
+    // GLTFLoader의 onProgress로 다운로드 진행률 받기
+    gltfLoader.load(
+      url,
+      (gltf) => {
+        if (isAborted) return
         
-        // Content-Length가 없으면 초기 청크로 추정
-        if (total === 0) {
-          // 첫 번째 청크를 읽어서 크기 추정 시도
-          const firstChunk = await reader.read()
-          if (!firstChunk.done && firstChunk.value) {
-            chunks.push(firstChunk.value)
-            loaded += firstChunk.value.length
-            // 첫 청크 크기의 100배로 추정 (나중에 업데이트됨)
-            estimatedTotal = firstChunk.value.length * 100
-          }
-        }
+        const root = gltf.scene
         
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          
-          chunks.push(value)
-          loaded += value.length
-          
-          // 진행률 업데이트 (Content-Length가 없어도 추정값 사용)
-          let percent = 0
-          if (total > 0) {
-            percent = Math.min((loaded / total) * 100, 99) // 99%까지 (GLTF 파싱 1% 남김)
-          } else if (estimatedTotal > 0) {
-            // 추정값 사용하되 95%까지만 (나머지는 GLTF 파싱)
-            percent = Math.min((loaded / estimatedTotal) * 100, 95)
-          } else {
-            // 추정값도 없으면 로딩 중으로만 표시
-            percent = Math.min(50, (loaded / 1000000) * 50) // 1MB당 50%로 가정
-          }
-          
-          setLoadingProgress(percent)
-          if (onProgress) {
-            onProgress(percent)
-          }
-        }
-        
-        // 모든 청크를 하나로 합치기
-        const blob = new Blob(chunks)
-        const blobUrl = URL.createObjectURL(blob)
-        
-        // 다운로드 완료 표시
-        setLoadingProgress(95)
-        if (onProgress) {
-          onProgress(95)
-        }
-        
-        loadGLTF(blobUrl, onProgress, onLoaded)
-        
-        return () => {
-          if (blobUrl) URL.revokeObjectURL(blobUrl)
-        }
-      } catch (error) {
-        if (error.name !== 'AbortError') {
-          console.error('Fetch error:', error)
-        }
-      }
-    }
-    
-    const loadGLTF = (blobUrl, onProgress, onLoaded) => {
-      // GLTFLoader로 로드
-      const loader = new GLTFLoader()
-      loader.setDRACOLoader(dracoLoader)
-      
-      loader.load(
-        blobUrl,
-        (gltf) => {
-            const loadedScene = gltf.scene
+        // 재질 및 그림자 설정
+        root.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = true
+            child.receiveShadow = true
+            child.frustumCulled = false
             
-            // 바운딩 박스 계산하여 자동 스케일 및 카메라 조정
-            const box = new THREE.Box3().setFromObject(loadedScene)
-            
-            if (!box.isEmpty()) {
-              const center = box.getCenter(new THREE.Vector3())
-              const size = box.getSize(new THREE.Vector3())
-              const maxDim = Math.max(size.x, size.y, size.z)
-              
-              // 메쉬를 정확히 원점(0,0,0)으로 이동
-              loadedScene.position.set(-center.x, -center.y, -center.z)
-              
-              // 재질 및 그림자 설정
-              loadedScene.traverse((child) => {
-                if (child.isMesh) {
-                  child.castShadow = true
-                  child.receiveShadow = true
-                  child.frustumCulled = false
-                  
-                  // 재질 설정
-                  if (!child.material) {
-                    child.material = new THREE.MeshStandardMaterial({
-                      color: 0x667eea,
-                      metalness: 0.1,
-                      roughness: 0.5
-                    })
-                  } else {
-                    if (Array.isArray(child.material)) {
-                      child.material.forEach(mat => {
-                        if (mat) {
-                          mat.needsUpdate = true
-                          mat.visible = true
-                        }
-                      })
-                    } else {
-                      child.material.needsUpdate = true
-                      child.material.visible = true
-                    }
-                  }
-                  
-                  child.visible = true
-                }
+            if (!child.material) {
+              child.material = new THREE.MeshStandardMaterial({
+                color: 0x667eea,
+                metalness: 0.1,
+                roughness: 0.5
               })
-              
-              loadedScene.visible = true
-              
-              console.log('Scene loaded:', {
-                center: { x: center.x, y: center.y, z: center.z },
-                size: { x: size.x, y: size.y, z: size.z },
-                maxDim: maxDim,
-                position: loadedScene.position
-              })
-              
-              setScene(loadedScene)
-              
-              if (onLoaded) {
-                onLoaded({ center, size, maxDim })
-              }
             } else {
-              console.error('Empty bounding box')
-              setScene(loadedScene)
+              if (Array.isArray(child.material)) {
+                child.material.forEach(mat => {
+                  if (mat) {
+                    mat.needsUpdate = true
+                    mat.visible = true
+                  }
+                })
+              } else {
+                child.material.needsUpdate = true
+                child.material.visible = true
+              }
             }
             
-          URL.revokeObjectURL(blobUrl)
-        },
-        (progress) => {
-          // GLTFLoader의 progress는 모델 파싱 진행률 (파일 다운로드와는 별개)
-          if (progress.total > 0 && onProgress) {
-            // 다운로드는 이미 완료되었으므로 90-100% 범위로 표시
-            const percent = 90 + (progress.loaded / progress.total) * 10
-            setLoadingProgress(percent)
-            onProgress(percent)
+            child.visible = true
           }
-        },
-        (error) => {
-          console.error('GLTF loading error:', error)
-          URL.revokeObjectURL(blobUrl)
+        })
+        
+        root.visible = true
+        
+        // fitToView로 원점·스케일 정확히 맞추기
+        if (controlsRef?.current && cameraRef?.current) {
+          const { pivot, maxDim } = fitToView(root, cameraRef.current, controlsRef.current, { targetSize: 5 })
+          
+          console.log('Scene fitted:', {
+            maxDim: maxDim,
+            position: pivot.position,
+            scale: pivot.scale
+          })
+          
+          setScene(pivot)
+          
+          if (onLoaded) {
+            onLoaded({ maxDim })
+          }
+        } else {
+          // controls/camera가 아직 없으면 기본 처리
+          setScene(root)
+          if (onLoaded) {
+            onLoaded({ root })
+          }
         }
-      )
-    }
-    
-    loadModel()
+      },
+      (progress) => {
+        // GLTFLoader의 onProgress: 다운로드 진행률 (0-90%)
+        if (progress.total > 0 && onProgress) {
+          const percent = (progress.loaded / progress.total) * 90 // 다운로드 0-90%
+          onProgress(percent)
+        }
+      },
+      (error) => {
+        console.error('GLTF loading error:', error)
+      }
+    )
     
     return () => {
-      abortController.abort()
+      isAborted = true
     }
-  }, [url, onProgress, onLoaded])
+  }, [url, onProgress, onLoaded, controlsRef, cameraRef])
   
-  if (!scene) {
-    // 로딩 중 progress 표시
-    return (
-      <Html center>
-        <div style={{
-          background: 'rgba(0, 0, 0, 0.9)',
-          color: 'white',
-          padding: '30px 40px',
-          borderRadius: '12px',
-          textAlign: 'center',
-          minWidth: '300px'
-        }}>
-          <div style={{ marginBottom: '20px', fontSize: '18px', fontWeight: '600' }}>
-            3D 메쉬 로딩 중...
-          </div>
-          <div style={{
-            width: '280px',
-            height: '12px',
-            background: 'rgba(255, 255, 255, 0.2)',
-            borderRadius: '6px',
-            overflow: 'hidden',
-            margin: '0 auto 15px'
-          }}>
-            <div style={{
-              width: `${loadingProgress}%`,
-              height: '100%',
-              background: 'linear-gradient(90deg, var(--primary-color), var(--primary-dark))',
-              transition: 'width 0.3s ease',
-              borderRadius: '6px'
-            }} />
-          </div>
-          <div style={{ fontSize: '16px', fontWeight: '500', marginBottom: '8px' }}>
-            {loadingProgress.toFixed(1)}%
-          </div>
-          <div style={{ fontSize: '12px', opacity: 0.7 }}>
-            {loadingProgress < 95 ? '파일 다운로드 중...' : '메쉬 파싱 중...'}
-          </div>
-        </div>
-      </Html>
-    )
-  }
+  // Canvas 외부에서 로딩 표시하지 않음 (DOM 오버레이 사용)
+  if (!scene) return null
   
   return <primitive object={scene} />
 }
@@ -246,8 +174,10 @@ function MeshViewer() {
   const [fileSize, setFileSize] = useState(null)
   const [meshLoaded, setMeshLoaded] = useState(false)
   const [error, setError] = useState(null)
+  const [loadStage, setLoadStage] = useState('download') // 'download' | 'parse'
   const containerRef = useRef(null)
   const cameraRef = useRef(null)
+  const controlsRef = useRef(null)
 
   useEffect(() => {
     if (!user) {
@@ -289,19 +219,16 @@ function MeshViewer() {
   
   const handleProgress = (percent) => {
     setLoadProgress(percent)
+    // 90% 이상이면 파싱 단계
+    if (percent >= 90) {
+      setLoadStage('parse')
+    }
   }
   
   const handleMeshLoaded = (info) => {
     setMeshLoaded(true)
+    setLoadProgress(100)
     console.log('Mesh loaded:', info)
-    // 메쉬 크기에 따라 카메라 거리 조정
-    if (info && info.maxDim) {
-      const maxDim = info.maxDim
-      // OrbitControls 거리 범위를 메쉬 크기의 0.5배부터 5배까지로 설정
-      const minDist = Math.max(0.1, maxDim * 0.5)
-      const maxDist = Math.max(50, maxDim * 5)
-      setCameraDistance({ min: minDist, max: maxDist })
-    }
   }
   
   const [cameraDistance, setCameraDistance] = useState({ min: 0.1, max: 50 })
@@ -448,9 +375,59 @@ function MeshViewer() {
           overflow: 'hidden'
         }}
       >
+        {/* Canvas 외부 DOM 오버레이 로딩바 */}
+        {!meshLoaded && loadProgress > 0 && (
+          <div style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            zIndex: 1000,
+            background: 'rgba(0, 0, 0, 0.9)',
+            color: 'white',
+            padding: '30px 40px',
+            borderRadius: '12px',
+            textAlign: 'center',
+            minWidth: '300px',
+            boxShadow: '0 4px 20px rgba(0,0,0,0.5)'
+          }}>
+            <div style={{ marginBottom: '20px', fontSize: '18px', fontWeight: '600' }}>
+              3D 메쉬 로딩 중...
+            </div>
+            <div style={{
+              width: '280px',
+              height: '12px',
+              background: 'rgba(255, 255, 255, 0.2)',
+              borderRadius: '6px',
+              overflow: 'hidden',
+              margin: '0 auto 15px'
+            }}>
+              <div style={{
+                width: `${loadProgress}%`,
+                height: '100%',
+                background: 'linear-gradient(90deg, var(--primary-color), var(--primary-dark))',
+                transition: 'width 0.3s ease',
+                borderRadius: '6px'
+              }} />
+            </div>
+            <div style={{ fontSize: '16px', fontWeight: '500', marginBottom: '8px' }}>
+              {loadProgress.toFixed(1)}%
+            </div>
+            <div style={{ fontSize: '12px', opacity: 0.7 }}>
+              {loadStage === 'download' ? '파일 다운로드 중...' : '메쉬 파싱/디코딩 중...'}
+            </div>
+            {fileSize && (
+              <div style={{ fontSize: '11px', opacity: 0.6, marginTop: '8px' }}>
+                파일 크기: {fileSize} MB
+              </div>
+            )}
+          </div>
+        )}
+        
         {meshUrl && (
           <Canvas 
             shadows
+            frameloop="always"
             gl={{ 
               preserveDrawingBuffer: true,
               powerPreference: "high-performance",
@@ -469,22 +446,29 @@ function MeshViewer() {
               })
             }}
           >
+            <PerspectiveCamera ref={cameraRef} makeDefault position={[3, 3, 3]} fov={50} />
+            <ambientLight intensity={0.8} />
+            <directionalLight position={[10, 10, 5]} intensity={1.5} castShadow />
+            <pointLight position={[-10, -10, -5]} intensity={0.5} />
+            <OrbitControls
+              ref={controlsRef}
+              enablePan={true}
+              enableZoom={true}
+              enableRotate={true}
+              target={[0, 0, 0]}
+            />
+            <gridHelper args={[10, 10]} />
+            <axesHelper args={[5]} />
             <Suspense fallback={null}>
-              <PerspectiveCamera ref={cameraRef} makeDefault position={[3, 3, 3]} fov={50} />
-              <ambientLight intensity={0.8} />
-              <directionalLight position={[10, 10, 5]} intensity={1.5} castShadow />
-              <pointLight position={[-10, -10, -5]} intensity={0.5} />
-              <Model url={meshUrl} onProgress={handleProgress} onLoaded={handleMeshLoaded} />
-              <OrbitControls
-                enablePan={true}
-                enableZoom={true}
-                enableRotate={true}
-                minDistance={cameraDistance.min}
-                maxDistance={cameraDistance.max}
-                target={[0, 0, 0]}
-              />
-              <gridHelper args={[10, 10]} />
-              <axesHelper args={[5]} />
+              {meshUrl && (
+                <Model 
+                  url={meshUrl} 
+                  onProgress={handleProgress} 
+                  onLoaded={handleMeshLoaded}
+                  controlsRef={controlsRef}
+                  cameraRef={cameraRef}
+                />
+              )}
             </Suspense>
           </Canvas>
         )}
