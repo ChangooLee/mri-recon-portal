@@ -27,8 +27,6 @@ def is_same_protocol(ds_a, ds_b):
             return tuple(val) if val is not None else ()
         return val
     
-    keys_to_check = ['SeriesInstanceUID', 'Rows', 'Columns', 'PixelSpacing', 'ImageType']
-    
     # SeriesInstanceUID 체크
     if get(ds_a, 'SeriesInstanceUID') != get(ds_b, 'SeriesInstanceUID'):
         return False
@@ -45,6 +43,80 @@ def is_same_protocol(ds_a, ds_b):
     return (get(ds_a, 'Rows') == get(ds_b, 'Rows') and
             get(ds_a, 'Columns') == get(ds_b, 'Columns') and
             get(ds_a, 'PixelSpacing') == get(ds_b, 'PixelSpacing'))
+
+
+def score_stack_for_3d(stack_files):
+    """
+    스택을 3D 볼륨 적합도로 점수화
+    반환: (score, metadata_dict)
+    높은 점수 = 3D 등방성 볼륨에 가까움
+    """
+    if not stack_files:
+        return (0, {})
+    
+    first_ds = stack_files[0][1]
+    
+    # 기본 메타데이터
+    slice_thickness = getattr(first_ds, 'SliceThickness', None)
+    spacing_between = getattr(first_ds, 'SpacingBetweenSlices', None)
+    pixel_spacing = getattr(first_ds, 'PixelSpacing', None)
+    image_type = str(getattr(first_ds, 'ImageType', '') or '').upper()
+    series_desc = str(getattr(first_ds, 'SeriesDescription', '') or '').upper()
+    
+    score = 0
+    metadata = {
+        'slice_thickness': slice_thickness,
+        'spacing_between': spacing_between,
+        'pixel_spacing': pixel_spacing,
+        'image_type': image_type,
+        'series_description': series_desc,
+        'is_3d': False,
+        'reason': []
+    }
+    
+    # 1) 3D 시퀀스 키워드 체크 (높은 가점)
+    if any(keyword in series_desc or keyword in image_type 
+           for keyword in ['3D', 'VIBE', 'CUBE', 'SPACE', 'BRAVO', 'MPRAGE', 'FSPGR']):
+        score += 100
+        metadata['is_3d'] = True
+        metadata['reason'].append('3D sequence keyword found')
+    
+    # 2) SliceThickness 체크 (얇을수록 좋음)
+    if slice_thickness is not None:
+        if slice_thickness <= 1.2:
+            score += 50  # 등방성에 가까움
+            metadata['reason'].append(f'Thin slices ({slice_thickness}mm)')
+        elif slice_thickness <= 1.5:
+            score += 30
+            metadata['reason'].append(f'Moderate slice thickness ({slice_thickness}mm)')
+        elif slice_thickness <= 2.0:
+            score += 10
+            metadata['reason'].append(f'Thicker slices ({slice_thickness}mm)')
+        else:
+            score -= 20  # 너무 두꺼움
+            metadata['reason'].append(f'Very thick slices ({slice_thickness}mm)')
+    
+    # 3) SpacingBetweenSlices ≈ SliceThickness (overlap/공백 없음)
+    if slice_thickness is not None and spacing_between is not None:
+        ratio = spacing_between / slice_thickness if slice_thickness > 0 else None
+        if ratio is not None and 0.9 <= ratio <= 1.1:
+            score += 20  # 거의 겹침/공백 없음
+            metadata['reason'].append(f'Uniform spacing (ratio={ratio:.2f})')
+    
+    # 4) In-plane spacing이 작을수록 좋음
+    if pixel_spacing is not None and len(pixel_spacing) >= 2:
+        in_plane_spacing = min(pixel_spacing[0], pixel_spacing[1])
+        if in_plane_spacing <= 0.5:
+            score += 10
+            metadata['reason'].append(f'Fine in-plane spacing ({in_plane_spacing}mm)')
+    
+    # 5) 파일 수 (충분한 슬라이스)
+    if len(stack_files) >= 50:
+        score += 10
+        metadata['reason'].append(f'Sufficient slices ({len(stack_files)})')
+    
+    metadata['score'] = score
+    return (score, metadata)
 
 
 def group_stacks_by_orientation(dicom_paths, cos_eps=1e-3):
@@ -129,7 +201,7 @@ def group_stacks_by_orientation(dicom_paths, cos_eps=1e-3):
     return stacks
 
 
-def read_volume_sorted(stack_files, keep_original_spacing=True):
+def read_volume_sorted(stack_files, keep_original_spacing=None):
     """
     스택 내 파일들을 법선 벡터 기준으로 정렬하고 볼륨을 읽음
     표준 방향(RAI)으로 재배향, spacing은 원본 유지 (선택적)
@@ -167,7 +239,10 @@ def read_volume_sorted(stack_files, keep_original_spacing=True):
     reader.SetFileNames(fnames)
     img = reader.Execute()
     
-    logger.info(f"Original image size: {img.GetSize()}, spacing: {img.GetSpacing()}, direction: {img.GetDirection()}")
+    original_spacing = img.GetSpacing()
+    original_size = img.GetSize()
+    
+    logger.info(f"Original image size: {original_size}, spacing: {original_spacing}, direction: {img.GetDirection()}")
     
     # 표준 방향(RAI)으로 재배향
     try:
@@ -178,30 +253,54 @@ def read_volume_sorted(stack_files, keep_original_spacing=True):
         direction = np.array(img_oriented.GetDirection()).reshape(3, 3)
         is_identity = np.allclose(direction, np.eye(3), atol=0.1)
         logger.info(f"Direction matrix is near identity: {is_identity}")
+        if not is_identity:
+            logger.warning(f"Direction matrix: {direction}")
     except Exception as e:
         logger.warning(f"DICOMOrient failed: {e}, using original image")
         img_oriented = img
     
-    # 원본 spacing 유지 (기본값)
-    if keep_original_spacing:
-        logger.info("Keeping original spacing")
+    # 등방성 리샘플링 판단
+    # keep_original_spacing이 명시적으로 False면 항상 리샘플
+    # None이면 자동 판단: 비등방성이 크면 리샘플
+    if keep_original_spacing is False:
+        should_resample = True
+    elif keep_original_spacing is True:
+        should_resample = False
+    else:
+        # 자동 판단: in-plane spacing과 slice spacing 차이가 크면 리샘플
+        spacing = np.array(img_oriented.GetSpacing())
+        in_plane = min(spacing[0], spacing[1])
+        slice_spacing = spacing[2]
+        anisotropy_ratio = max(in_plane, slice_spacing) / min(in_plane, slice_spacing)
+        should_resample = anisotropy_ratio > 1.5  # 비율이 1.5배 이상이면 리샘플
+        logger.info(f"Anisotropy ratio: {anisotropy_ratio:.2f}, will resample: {should_resample}")
+    
+    if not should_resample:
+        logger.info("Keeping original spacing (isotropic or user requested)")
         return img_oriented
     
-    # 등방성 리샘플링 (선택적, 0.8-1.2mm 권장)
-    spacing_target = (1.0, 1.0, 1.0)
+    # 등방성 리샘플링: iso = max(min(in-plane spacing, 1.0mm), 0.8mm) - 메모리 고려
+    spacing_array = np.array(img_oriented.GetSpacing())
+    in_plane_min = min(spacing_array[0], spacing_array[1])
+    # 최소 0.8mm, 최대 1.0mm로 설정하여 메모리 사용량 제어
+    iso_spacing = min(max(in_plane_min, 0.8), 1.0)
+    spacing_target = (iso_spacing, iso_spacing, iso_spacing)
+    logger.info(f"Setting isotropic spacing to {iso_spacing}mm (was {in_plane_min}mm in-plane) for memory optimization")
+    
     size_old = img_oriented.GetSize()
     spacing_old = img_oriented.GetSpacing()
     
     new_size = [int(round(osz * osp / nsp)) 
                 for osz, osp, nsp in zip(size_old, spacing_old, spacing_target)]
     
-    logger.info(f"Resampling from {size_old} @ {spacing_old} to {new_size} @ {spacing_target}")
+    logger.info(f"Resampling from {size_old} @ {spacing_old} to {new_size} @ {spacing_target} (BSpline interpolation)")
     
+    # BSpline 보간 사용 (강도 유지)
     img_iso = sitk.Resample(
         img_oriented,
         new_size,
         sitk.Transform(),
-        sitk.sitkLinear,
+        sitk.sitkBSpline,  # BSpline 보간 (가우시안보다 강도 유지)
         img_oriented.GetOrigin(),
         spacing_target,
         img_oriented.GetDirection(),
@@ -227,34 +326,31 @@ def preprocess_mri_for_surface(img_iso: sitk.Image):
     logger.info(f"Percentiles: 1%={p1:.1f}, 99%={p99:.1f}")
     arr = np.clip((arr - p1) / max(p99 - p1, 1e-6), 0, 1)
     
-    # 2) 가우시안 스무딩 (물리 단위 1.0mm)
-    # SimpleITK의 스무딩은 물리 단위를 사용
-    smoothed_img = sitk.SmoothingRecursiveGaussian(img_iso, sigma=1.0)
+    # 2) 가우시안 스무딩 (물리 단위, 리샘플 후라면 약 0.8-1.2mm)
+    spacing = np.array(img_iso.GetSpacing())
+    sigma_mm = min(np.mean(spacing), 1.0)  # spacing 평균 또는 1.0mm 중 작은 값
+    smoothed_img = sitk.SmoothingRecursiveGaussian(img_iso, sigma=sigma_mm)
     smoothed = sitk.GetArrayFromImage(smoothed_img).astype(np.float32)
-    
-    # 원본 배열에 윈도잉 적용
-    arr_original = sitk.GetArrayFromImage(img_iso).astype(np.float32)
-    arr_windowed = np.clip((arr_original - p1) / max(p99 - p1, 1e-6), 0, 1)
     
     # 스무딩된 배열에 윈도잉 적용
     p1_smooth, p99_smooth = np.percentile(smoothed, (1, 99))
-    smoothed = np.clip((smoothed - p1_smooth) / max(p99_smooth - p1_smooth, 1e-6), 0, 1)
+    smoothed_windowed = np.clip((smoothed - p1_smooth) / max(p99_smooth - p1_smooth, 1e-6), 0, 1)
     
-    logger.info(f"After smoothing: range=[{smoothed.min():.3f}, {smoothed.max():.3f}]")
+    logger.info(f"After smoothing (σ={sigma_mm}mm): range=[{smoothed_windowed.min():.3f}, {smoothed_windowed.max():.3f}]")
     
     # 3) 3D Otsu 임계값
     try:
-        t = threshold_otsu(smoothed)
+        t = threshold_otsu(smoothed_windowed)
         logger.info(f"Otsu threshold: {t:.3f}")
-        mask = smoothed > t
+        mask = smoothed_windowed > t
     except Exception as e:
         logger.warning(f"Otsu threshold failed: {e}, using median")
-        t = np.median(smoothed)
-        mask = smoothed > t
+        t = np.median(smoothed_windowed)
+        mask = smoothed_windowed > t
     
     logger.info(f"Binary mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
     
-    # 4) 작은 덩어리 제거 + 구멍 메우기 (연결요소 필터)
+    # 4) 작은 덩어리 제거 + 연결성 분석
     structure = ndi.generate_binary_structure(3, 2)
     mask = ndi.binary_opening(mask, structure=structure)
     
@@ -262,14 +358,71 @@ def preprocess_mri_for_surface(img_iso: sitk.Image):
     counts = np.bincount(lbl.ravel())
     counts[0] = 0  # 배경 제외
     
-    if len(counts) > 1:
-        keep = np.argmax(counts)  # 가장 큰 성분
-        logger.info(f"Keeping largest component: {keep} ({counts[keep]} voxels)")
+    logger.info(f"Found {n_components} connected components")
+    
+    if n_components > 0:
+        # 가장 큰 성분 찾기
+        largest_idx = np.argmax(counts)
+        largest_size = counts[largest_idx]
+        
+        # 메모리 절약: 작은 컴포넌트는 즉시 제외 (최대 성분의 1% 미만)
+        min_size_threshold = largest_size * 0.01
+        
+        # 중심부에 가까운 성분 우선 선택 (외곽 테이블/코일 제외)
+        center = np.array(arr.shape) / 2
+        best_component = largest_idx
+        best_score = largest_size
+        
+        # 최대 성분의 30% 이상인 것만 고려 (메모리 절약)
+        for comp_id in range(1, len(counts)):
+            if counts[comp_id] < largest_size * 0.3:
+                continue
+            if counts[comp_id] < min_size_threshold:
+                continue
+            
+            # 무게중심 계산 (메모리 효율적: 샘플링)
+            comp_mask = (lbl == comp_id)
+            # 모든 좌표를 저장하지 않고 샘플링하여 메모리 절약
+            comp_coords = np.argwhere(comp_mask)
+            if len(comp_coords) == 0:
+                continue
+            
+            # 너무 많은 좌표면 샘플링
+            if len(comp_coords) > 100000:
+                step = len(comp_coords) // 50000
+                comp_coords = comp_coords[::step]
+            
+            centroid = comp_coords.mean(axis=0)
+            dist_to_center = np.linalg.norm(centroid - center)
+            
+            # 점수: 크기 - 중심으로부터의 거리 (정규화)
+            max_dist = np.linalg.norm(center)
+            normalized_dist = dist_to_center / max_dist if max_dist > 0 else 1.0
+            score = counts[comp_id] * (1.0 - normalized_dist * 0.3)  # 거리 페널티 30%
+            
+            if score > best_score:
+                best_score = score
+                best_component = comp_id
+                logger.info(f"Component {comp_id} closer to center: size={counts[comp_id]}, dist={dist_to_center:.1f}, score={score:.0f}")
+        
+        keep = best_component
+        logger.info(f"Keeping component: {keep} (size={counts[keep]} voxels, score={best_score:.0f})")
         mask = (lbl == keep)
+        
+        # 작은 컴포넌트 정리 (메모리 해제)
+        del lbl, counts
+        
+        # 컴포넌트 바운딩 박스 로그
+        coords = np.argwhere(mask)
+        if len(coords) > 0:
+            bbox_min = coords.min(axis=0)
+            bbox_max = coords.max(axis=0)
+            bbox_size = bbox_max - bbox_min
+            logger.info(f"Bounding box: min={bbox_min}, max={bbox_max}, size={bbox_size}")
     else:
         logger.warning("No components found after labeling")
     
-    # 5) 선택적: closing (구멍 메우기)
+    # 5) Closing (구멍 메우기)
     mask = ndi.binary_closing(mask, structure=ndi.generate_binary_structure(3, 1))
     
     logger.info(f"Final mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
@@ -329,13 +482,15 @@ def mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0
     mesh = trimesh.Trimesh(vertices=p_three, faces=faces, vertex_normals=normals, process=False)
     logger.info(f"Mesh created: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     
-    # 7) 메시 스무딩/간소화 (선택적)
+    # 7) 메시 스무딩/간소화 (후처리)
     try:
         logger.info("Applying Laplacian smoothing...")
         trimesh.smoothing.filter_laplacian(mesh, iterations=5, lamb=0.5)
         
-        target_faces = int(mesh.faces.shape[0] * 0.5)
-        logger.info(f"Simplifying mesh to {target_faces} faces...")
+        # Decimation 30-60% (step_size에 따라 조정)
+        decimation_ratio = 0.5 if step_size <= 2 else 0.4  # step_size가 클수록 더 간소화
+        target_faces = int(mesh.faces.shape[0] * decimation_ratio)
+        logger.info(f"Simplifying mesh to {target_faces} faces ({decimation_ratio*100:.0f}% of original)...")
         mesh = mesh.simplify_quadratic_decimation(target_faces)
         logger.info(f"Simplified mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     except Exception as e:
@@ -376,12 +531,56 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
             if not stacks:
                 return {"status": "error", "message": "No valid stacks found after grouping"}
             
-            # 가장 큰 스택 선택
-            largest_stack = max(stacks, key=len)
-            logger.info(f"Using largest stack with {len(largest_stack)} file(s)")
+            # 스택 점수화 및 최적 스택 선택
+            scored_stacks = []
+            for stack in stacks:
+                score, metadata = score_stack_for_3d(stack)
+                scored_stacks.append((score, stack, metadata))
             
-            # 볼륨 읽기 및 표준화 (원본 spacing 유지)
-            img_iso = read_volume_sorted(largest_stack, keep_original_spacing=True)
+            # 점수순 정렬 (높은 점수 = 3D/얇은 슬라이스 우선)
+            scored_stacks.sort(key=lambda x: x[0], reverse=True)
+            
+            best_score, best_stack, best_metadata = scored_stacks[0]
+            
+            logger.info(f"Stack selection results:")
+            for idx, (score, stack, metadata) in enumerate(scored_stacks[:3]):  # 상위 3개만 로그
+                logger.info(f"  [{idx+1}] Score={score}, Files={len(stack)}, "
+                          f"SliceThickness={metadata.get('slice_thickness')}, "
+                          f"Is3D={metadata.get('is_3d')}, Reasons={metadata.get('reason')}")
+            
+            logger.info(f"Selected stack: {len(best_stack)} file(s), score={best_score}")
+            logger.info(f"Selected stack metadata: {best_metadata}")
+            
+            # 정렬 품질 검증
+            if hasattr(best_stack[0][1], 'ImagePositionPatient') and best_stack[0][1].ImagePositionPatient:
+                first_ds = best_stack[0][1]
+                u = np.array(first_ds.ImageOrientationPatient[:3], dtype=float)
+                v = np.array(first_ds.ImageOrientationPatient[3:], dtype=float)
+                n = np.cross(u, v)
+                n /= (np.linalg.norm(n) + 1e-12)
+                
+                positions = []
+                for f, ds in best_stack:
+                    if hasattr(ds, 'ImagePositionPatient') and ds.ImagePositionPatient:
+                        pos = np.array(ds.ImagePositionPatient, dtype=float)
+                        t = np.dot(n, pos)
+                        positions.append(t)
+                
+                if len(positions) > 1:
+                    positions = np.array(positions)
+                    deltas = np.diff(np.sort(positions))
+                    median_delta = np.median(deltas)
+                    std_delta = np.std(deltas)
+                    non_increasing = np.sum(deltas <= 0)
+                    
+                    logger.info(f"Slice sorting quality: median Δt={median_delta:.3f}, std={std_delta:.3f}, "
+                              f"non-increasing={non_increasing}")
+                    
+                    if non_increasing > len(positions) * 0.1:  # 10% 이상이 비증가면 경고
+                        logger.warning(f"Many non-increasing slice positions ({non_increasing}/{len(positions)})")
+            
+            # 볼륨 읽기 및 표준화 (자동 판단: 비등방성이 크면 리샘플)
+            img_iso = read_volume_sorted(best_stack, keep_original_spacing=None)
             
             # 이미지 크기 검증
             image_array = sitk.GetArrayFromImage(img_iso)
@@ -392,7 +591,8 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
             
             # 메쉬 생성 (전처리 및 좌표 변환 포함)
             try:
-                mesh = mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0.5, step_size=2)
+                # step_size=3 권장 (노이즈 감소)
+                mesh = mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0.5, step_size=3)
                 
                 # STL 내보내기
                 stl_buffer = io.BytesIO()
