@@ -126,21 +126,70 @@ DB는 SQLAlchemy ORM 으로 관리하며 Alembic 마이그레이션을 지원합
 
 ## 🧠 Reconstruction Pipeline
 
-1️⃣ DICOM 업로드
-2️⃣ SimpleITK → 3D Volume 생성
-3️⃣ Marching Cubes → STL/GLTF 생성
-4️⃣ 선택적: MONAI Label 세그멘테이션
-5️⃣ 결과 MinIO 저장 및 DB 레코드 등록
-6️⃣ OHIF Viewer에서 2D/3D 렌더링
+### 개선된 DICOM → 3D 메쉬 파이프라인
+
+1️⃣ **DICOM 업로드 및 시리즈 선택**
+   - SeriesInstanceUID별 자동 그룹화
+   - 혼합 시리즈 감지 시 가장 큰 시리즈 자동 선택
+   - Geometry 일관성 검증 (Rows/Columns/PixelSpacing)
+
+2️⃣ **IPP 기반 정렬 및 Outlier 제거**
+   - ImagePositionPatient 기반 정확한 슬라이스 정렬
+   - 비정상 간격 슬라이스 자동 제거 (Δt 변동계수 기반)
+
+3️⃣ **고급 전처리**
+   - N4 Bias Field Correction (MRI 신호 불균일 보정)
+   - 비등방 가우시안 스무딩 (z 방향 강화)
+   - Intensity windowing → 3D Otsu 임계값
+   - 연결성 필터링 (최대 성분 선택, 중심 기반 스코링)
+
+4️⃣ **스마트 리샘플링**
+   - 이방성 비율(r) 기반 자동 전략
+   - 2D 두꺼운 슬라이스(≥3mm) 감지 시 원본 해상도 유지
+   - 등방성 리샘플링: r ≤ 1.5 → 0.6-0.8mm, r ≤ 3.0 → 1.0-1.2mm
+
+5️⃣ **Marching Cubes 및 좌표 변환**
+   - Spacing 이중 적용 버그 수정
+   - LPS → Three.js 좌표계 변환
+   - 단위 일원화: mm → m (1/1000)
+
+6️⃣ **메쉬 후처리**
+   - Laplacian smoothing
+   - Quadratic decimation (30-60%)
+   - ROI 크롭 (배경/테이블 제거)
+
+7️⃣ **결과 저장 및 시각화**
+   - STL/GLB 형식 내보내기
+   - Draco 압축 지원
+   - Three.js 기반 3D 뷰어 (자동 카메라 맞춤)
+   - DICOM 슬라이스 뷰어 (윈도잉 기능)
 
 ---
 
 ## 🧰 Dependencies
 
+### Backend
 * **FastAPI**, **Authlib**, **SQLAlchemy**, **Alembic**
-* **Celery**, **Redis**, **SimpleITK**, **scikit-image**, **trimesh**
-* **MONAI**, **PyTorch**
-* **OHIF Viewer**, **vtk.js**, **React**
+* **Celery**, **Redis**
+* **SimpleITK** (N4 bias correction, DICOM 읽기, 리샘플링)
+* **scikit-image** (marching cubes, thresholding)
+* **scipy** (ndimage: morphological operations, connected components)
+* **trimesh** (메쉬 생성, smoothing, decimation)
+* **pydicom** (DICOM 메타데이터 파싱)
+* **numpy**
+
+### AI/ML
+* **MONAI**, **PyTorch** (세그멘테이션)
+
+### Frontend
+* **React**, **Vite**
+* **Three.js**, **@react-three/fiber**, **@react-three/drei** (3D 메쉬 뷰어)
+* **DRACOLoader**, **MeshoptDecoder** (압축 메쉬 로딩)
+
+### 기타
+* **@gltf-transform/cli** (Draco 압축, Node.js 기반)
+* **MinIO** (Object Storage)
+* **PostgreSQL** (데이터베이스)
 
 ---
 
@@ -199,9 +248,19 @@ docker compose exec backend alembic upgrade head
 | ------- | -------------------------- | ------------ |
 | Phase 1 | MVP: DICOM → 3D Mesh + 로그인 | ✅ 완료 |
 | Phase 1.1 | DICOM Viewer 통합 | ✅ 완료 (슬라이스 뷰어 + 윈도잉 기능) |
+| Phase 1.2 | 고품질 재구성 파이프라인 | ✅ 완료 (N4 bias correction, IPP 정렬, 스마트 리샘플링, 좌표 변환 개선) |
 | Phase 2 | AI 세그멘테이션(MONAI) 통합        | ✅ 완료 (기본 구현) |
 | Phase 3 | PACS 연동 및 결과 검색            | 🔄 향후 계획 |
 | Phase 4 | K8s + GPU 스케일링 배포          | 🔄 향후 계획 |
+
+### 주요 개선사항 (v1.2)
+
+- ✅ **SeriesInstanceUID 자동 선택**: 혼합 시리즈 감지 시 가장 큰 시리즈 자동 선택
+- ✅ **IPP 기반 정렬**: ImagePositionPatient 기반 정확한 슬라이스 정렬 및 outlier 제거
+- ✅ **N4 Bias Correction**: MRI 신호 불균일 보정으로 전처리 품질 향상
+- ✅ **스마트 리샘플링**: 이방성 비율 기반 자동 전략 (가짜 구조 방지)
+- ✅ **좌표 변환 개선**: Spacing 이중 적용 버그 수정, mm → m 단위 일원화
+- ✅ **3D 뷰어 개선**: 자동 카메라 맞춤, 원점 정렬, Draco 압축 지원
 
 ## 🔧 개발 및 테스트
 
@@ -242,10 +301,12 @@ celery -A backend.app.worker.tasks.celery_app worker --loglevel=info
 
 ### 주의사항
 
-- Google OAuth2 자격증명은 반드시 설정해야 합니다
+- Google OAuth2 자격증명은 반드시 설정해야 합니다 (현재는 BYPASS_AUTH=True로 개발 모드)
 - DICOM 파일은 `.dcm` 또는 `.dicom` 확장자를 지원합니다
+- **혼합 시리즈 처리**: 여러 SeriesInstanceUID가 있는 경우 가장 큰 시리즈가 자동 선택됩니다
+- **권장 데이터**: 단일 3D 등방성 시퀀스 (SPACE, CUBE, VIBE 등) 또는 얇은 슬라이스(≤2mm) 2D 시리즈
+- **메모리 요구사항**: 대용량 볼륨 처리 시 Worker 메모리 8GB 이상 권장
 - MONAI 세그멘테이션은 기본 임계값 기반 구현으로 되어 있으며, 실제 프로덕션에서는 사전 학습된 모델을 사용해야 합니다
-- OHIF Viewer의 완전한 통합을 위해서는 DICOMweb 서버 설정이 추가로 필요할 수 있습니다
 
 ---
 
