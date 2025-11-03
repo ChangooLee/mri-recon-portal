@@ -335,34 +335,25 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
     
     logger.info(f"Anisotropy metrics: in-plane={in_plane:.3f}mm, slice={slice_spacing:.3f}mm, r={anisotropy_ratio_r:.2f}")
     
-    # 리샘플링 정책: 2D 슬라이스(두께≥3mm)는 등방 리샘플 금지
-    is_2d_thick_slices = slice_spacing >= 3.0
-    
     # 등방성 리샘플링 판단
     # keep_original_spacing이 명시적으로 False면 항상 리샘플
-    # None이면 자동 판단: 비등방성이 크면 리샘플 (단, 2D 두꺼운 슬라이스 제외)
+    # None이면 자동 판단: 비등방성이 크면 리샘플
     if keep_original_spacing is False:
         should_resample = True
     elif keep_original_spacing is True:
         should_resample = False
     else:
-        # 자동 판단
-        if is_2d_thick_slices:
-            # 2D 두꺼운 슬라이스: 등방 리샘플 금지 (원본 해상도 유지)
-            should_resample = False
-            logger.info(f"2D thick slices (≥3mm) detected: Skipping isotropic resampling to preserve quality")
-        else:
-            # 일반 케이스: in-plane spacing과 slice spacing 차이가 크면 리샘플
-            anisotropy_ratio = max(in_plane, slice_spacing) / min(in_plane, slice_spacing)
-            should_resample = anisotropy_ratio > 1.5  # 비율이 1.5배 이상이면 리샘플
-            logger.info(f"Anisotropy ratio: {anisotropy_ratio:.2f}, will resample: {should_resample}")
+        # 자동 판단: in-plane spacing과 slice spacing 차이가 크면 리샘플
+        anisotropy_ratio = max(in_plane, slice_spacing) / min(in_plane, slice_spacing)
+        should_resample = anisotropy_ratio > 1.5  # 비율이 1.5배 이상이면 리샘플
+        logger.info(f"Anisotropy ratio: {anisotropy_ratio:.2f}, will resample: {should_resample}")
     
     # 품질 경고
     if anisotropy_ratio_r > 3:
         logger.warning(f"⚠️ High anisotropy ratio (r={anisotropy_ratio_r:.2f} > 3): Low quality expected. SVR/3D sequence recommended.")
     
     if not should_resample:
-        logger.info("Keeping original spacing (isotropic or 2D thick slices)")
+        logger.info("Keeping original spacing (isotropic or user requested)")
         return img_oriented
     
     # 등방성 리샘플링: r에 따른 전략
