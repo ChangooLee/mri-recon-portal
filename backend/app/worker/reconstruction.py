@@ -119,85 +119,112 @@ def score_stack_for_3d(stack_files):
     return (score, metadata)
 
 
-def group_stacks_by_orientation(dicom_paths, cos_eps=1e-3):
+def group_by_series_uid(dicom_paths):
     """
-    DICOM 파일들을 각도(Orientation)별로 스택으로 자동 분류
-    SeriesInstanceUID, Rows/Columns/PixelSpacing도 함께 고려
+    DICOM 파일들을 SeriesInstanceUID별로 그룹화
+    반환: dict {series_uid: [(file_path, pydicom.Dataset), ...]}
     """
-    by_for = defaultdict(list)
+    by_series = defaultdict(list)
     
     for dicom_path in dicom_paths:
         try:
             ds = pydicom.dcmread(dicom_path, stop_before_pixels=True)
-            for_uid = getattr(ds, 'FrameOfReferenceUID', None)
-            if for_uid:
-                by_for[for_uid].append((dicom_path, ds))
-            else:
-                by_for['default'].append((dicom_path, ds))
+            series_uid = getattr(ds, 'SeriesInstanceUID', None)
+            if not series_uid:
+                logger.warning(f"No SeriesInstanceUID in {os.path.basename(dicom_path)}, skipping")
+                continue
+            
+            # 로컬라이저 제외
+            image_type = str(getattr(ds, 'ImageType', '') or '').upper()
+            if 'LOCALIZER' in image_type or 'SCOUT' in image_type:
+                logger.info(f"Skipping LOCALIZER/SCOUT: {os.path.basename(dicom_path)}")
+                continue
+            
+            by_series[series_uid].append((dicom_path, ds))
         except Exception as e:
             logger.warning(f"Failed to read DICOM metadata from {dicom_path}: {e}")
             continue
     
-    stacks = []
+    logger.info(f"Grouped {len(dicom_paths)} files into {len(by_series)} series by SeriesInstanceUID")
+    return dict(by_series)
+
+
+def validate_series_geometry(series_files):
+    """
+    같은 Series 내에서 이미지 크기/PixelSpacing/IOP/IPP 일관성 검증
+    반환: (is_valid, errors)
+    """
+    if not series_files:
+        return False, ["Empty series"]
     
-    for for_uid, items in by_for.items():
-        # SeriesInstanceUID + 프로토콜별로 먼저 분리
-        protocol_groups = defaultdict(list)
-        for f, ds in items:
-            series_uid = getattr(ds, 'SeriesInstanceUID', 'unknown')
-            protocol_key = (series_uid, 
-                          getattr(ds, 'Rows', None),
-                          getattr(ds, 'Columns', None),
-                          tuple(getattr(ds, 'PixelSpacing', ()) or []))
-            protocol_groups[protocol_key].append((f, ds))
+    errors = []
+    first_ds = series_files[0][1]
+    
+    # 기준값
+    ref_rows = getattr(first_ds, 'Rows', None)
+    ref_columns = getattr(first_ds, 'Columns', None)
+    ref_pixel_spacing = tuple(getattr(first_ds, 'PixelSpacing', ()) or [])
+    
+    for f, ds in series_files[1:]:
+        # Rows/Columns 체크
+        if getattr(ds, 'Rows', None) != ref_rows or getattr(ds, 'Columns', None) != ref_columns:
+            errors.append(f"Inconsistent matrix size in {os.path.basename(f)}")
         
-        # 각 프로토콜 그룹 내에서 orientation 기반 클러스터링
-        for protocol_key, protocol_items in protocol_groups.items():
-            groups = []
-            
-            for f, ds in protocol_items:
-                # 로컬라이저 제외
-                image_type = str(getattr(ds, 'ImageType', '') or '').upper()
-                if 'LOCALIZER' in image_type or 'SCOUT' in image_type:
-                    logger.info(f"Skipping LOCALIZER/SCOUT: {os.path.basename(f)}")
-                    continue
-                
-                if not hasattr(ds, 'ImageOrientationPatient') or ds.ImageOrientationPatient is None:
-                    continue
-                
-                try:
-                    u = np.array(ds.ImageOrientationPatient[:3], dtype=float)
-                    v = np.array(ds.ImageOrientationPatient[3:], dtype=float)
-                    
-                    n_cross = np.cross(u, v)
-                    n_norm = np.linalg.norm(n_cross)
-                    if n_norm < 1e-6:
-                        continue
-                    n = n_cross / n_norm
-                    
-                    placed = False
-                    for g in groups:
-                        if abs(np.dot(n, g['n'])) > 1 - cos_eps:
-                            g['files'].append((f, ds))
-                            placed = True
-                            break
-                    
-                    if not placed:
-                        groups.append({'n': n, 'files': [(f, ds)]})
-                        
-                except Exception as e:
-                    logger.warning(f"Error processing orientation for {os.path.basename(f)}: {e}")
-                    continue
-            
-            stacks.extend([g['files'] for g in groups])
-            
-            # orientation 정보가 없는 파일들도 별도 스택으로 추가 (프로토콜별로)
-            files_without_orientation = [(f, ds) for f, ds in protocol_items 
-                                        if not hasattr(ds, 'ImageOrientationPatient') or ds.ImageOrientationPatient is None]
-            if files_without_orientation:
-                stacks.append(files_without_orientation)
+        # PixelSpacing 체크
+        pixel_spacing = tuple(getattr(ds, 'PixelSpacing', ()) or [])
+        if pixel_spacing != ref_pixel_spacing:
+            errors.append(f"Inconsistent PixelSpacing in {os.path.basename(f)}")
     
-    logger.info(f"Grouped {len(dicom_paths)} files into {len(stacks)} stack(s)")
+    if errors:
+        logger.warning(f"Geometry inconsistencies found: {errors}")
+        return False, errors
+    
+    return True, []
+
+
+def group_stacks_by_orientation(series_files, cos_eps=1e-3):
+    """
+    같은 Series 내에서 각도(Orientation)별로 스택으로 분류 (보조 함수)
+    반환: [stack1, stack2, ...] (각 스택은 (file_path, ds) 튜플 리스트)
+    """
+    groups = []
+    
+    for f, ds in series_files:
+        if not hasattr(ds, 'ImageOrientationPatient') or ds.ImageOrientationPatient is None:
+            continue
+        
+        try:
+            u = np.array(ds.ImageOrientationPatient[:3], dtype=float)
+            v = np.array(ds.ImageOrientationPatient[3:], dtype=float)
+            
+            n_cross = np.cross(u, v)
+            n_norm = np.linalg.norm(n_cross)
+            if n_norm < 1e-6:
+                continue
+            n = n_cross / n_norm
+            
+            placed = False
+            for g in groups:
+                if abs(np.dot(n, g['n'])) > 1 - cos_eps:
+                    g['files'].append((f, ds))
+                    placed = True
+                    break
+            
+            if not placed:
+                groups.append({'n': n, 'files': [(f, ds)]})
+                
+        except Exception as e:
+            logger.warning(f"Error processing orientation for {os.path.basename(f)}: {e}")
+            continue
+    
+    # orientation 정보가 없는 파일들도 별도 스택으로 추가
+    files_without_orientation = [(f, ds) for f, ds in series_files 
+                                if not hasattr(ds, 'ImageOrientationPatient') or ds.ImageOrientationPatient is None]
+    if files_without_orientation:
+        groups.append({'n': None, 'files': files_without_orientation})
+    
+    stacks = [g['files'] for g in groups]
+    logger.info(f"Grouped {len(series_files)} files into {len(stacks)} orientation stack(s) within series")
     return stacks
 
 
@@ -232,7 +259,40 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
         else:
             return getattr(ds, 'InstanceNumber', 0)
     
+    # IPP 기반 정렬
     sorted_files = sorted(stack_files, key=lambda x: get_position_dot(x[1]))
+    
+    # Outlier 제거: Δt 변동계수 > 10%
+    if len(sorted_files) > 2:
+        t_values = [get_position_dot(ds) for _, ds in sorted_files]
+        deltas = np.diff(np.sort(t_values))
+        median_delta = np.median(deltas)
+        
+        # 변동계수 계산
+        if median_delta > 0:
+            cv = np.std(deltas) / median_delta
+            logger.info(f"Slice spacing CV: {cv:.3f} (median Δt={median_delta:.3f})")
+        
+        # Outlier 판단: |Δt - median| > 20%
+        valid_files = [sorted_files[0]]  # 첫 번째는 항상 포함
+        removed_count = 0
+        
+        for i in range(1, len(sorted_files)):
+            prev_t = get_position_dot(sorted_files[i-1][1])
+            curr_t = get_position_dot(sorted_files[i][1])
+            delta = abs(curr_t - prev_t)
+            
+            if delta > 0 and abs(delta - median_delta) / median_delta <= 0.2:
+                valid_files.append(sorted_files[i])
+            else:
+                removed_count += 1
+                logger.warning(f"Removing outlier slice: Δt={delta:.3f} vs median={median_delta:.3f} ({os.path.basename(sorted_files[i][0])})")
+        
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} outlier slice(s), keeping {len(valid_files)}")
+            sorted_files = valid_files
+        else:
+            logger.info(f"Sorted by dot(n, IPP), dz={median_delta:.3f}mm, removed_outliers=0")
     
     fnames = [f for f, _ in sorted_files]
     reader = sitk.ImageSeriesReader()
@@ -242,7 +302,14 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
     original_spacing = img.GetSpacing()
     original_size = img.GetSize()
     
-    logger.info(f"Original image size: {original_size}, spacing: {original_spacing}, direction: {img.GetDirection()}")
+    # 유효 z-spacing 계산 (outlier 제거 후)
+    if len(sorted_files) > 1:
+        t_values_final = [get_position_dot(ds) for _, ds in sorted_files]
+        deltas_final = np.diff(sorted(t_values_final))
+        dz_mm = np.median(deltas_final) if len(deltas_final) > 0 else original_spacing[2]
+        logger.info(f"Original image size: {original_size}, spacing: {original_spacing}, dz={dz_mm:.3f}mm")
+    else:
+        logger.info(f"Original image size: {original_size}, spacing: {original_spacing}")
     
     # 표준 방향(RAI)으로 재배향
     try:
@@ -259,33 +326,62 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
         logger.warning(f"DICOMOrient failed: {e}, using original image")
         img_oriented = img
     
+    # 이방성 비율 계산: r = slice_thickness / mean(in-plane spacing)
+    spacing = np.array(img_oriented.GetSpacing())
+    in_plane = min(spacing[0], spacing[1])
+    slice_spacing = spacing[2]
+    mean_in_plane = (spacing[0] + spacing[1]) / 2
+    anisotropy_ratio_r = slice_spacing / mean_in_plane if mean_in_plane > 0 else 999
+    
+    logger.info(f"Anisotropy metrics: in-plane={in_plane:.3f}mm, slice={slice_spacing:.3f}mm, r={anisotropy_ratio_r:.2f}")
+    
+    # 리샘플링 정책: 2D 슬라이스(두께≥3mm)는 등방 리샘플 금지
+    is_2d_thick_slices = slice_spacing >= 3.0
+    
     # 등방성 리샘플링 판단
     # keep_original_spacing이 명시적으로 False면 항상 리샘플
-    # None이면 자동 판단: 비등방성이 크면 리샘플
+    # None이면 자동 판단: 비등방성이 크면 리샘플 (단, 2D 두꺼운 슬라이스 제외)
     if keep_original_spacing is False:
         should_resample = True
     elif keep_original_spacing is True:
         should_resample = False
     else:
-        # 자동 판단: in-plane spacing과 slice spacing 차이가 크면 리샘플
-        spacing = np.array(img_oriented.GetSpacing())
-        in_plane = min(spacing[0], spacing[1])
-        slice_spacing = spacing[2]
-        anisotropy_ratio = max(in_plane, slice_spacing) / min(in_plane, slice_spacing)
-        should_resample = anisotropy_ratio > 1.5  # 비율이 1.5배 이상이면 리샘플
-        logger.info(f"Anisotropy ratio: {anisotropy_ratio:.2f}, will resample: {should_resample}")
+        # 자동 판단
+        if is_2d_thick_slices:
+            # 2D 두꺼운 슬라이스: 등방 리샘플 금지 (원본 해상도 유지)
+            should_resample = False
+            logger.info(f"2D thick slices (≥3mm) detected: Skipping isotropic resampling to preserve quality")
+        else:
+            # 일반 케이스: in-plane spacing과 slice spacing 차이가 크면 리샘플
+            anisotropy_ratio = max(in_plane, slice_spacing) / min(in_plane, slice_spacing)
+            should_resample = anisotropy_ratio > 1.5  # 비율이 1.5배 이상이면 리샘플
+            logger.info(f"Anisotropy ratio: {anisotropy_ratio:.2f}, will resample: {should_resample}")
+    
+    # 품질 경고
+    if anisotropy_ratio_r > 3:
+        logger.warning(f"⚠️ High anisotropy ratio (r={anisotropy_ratio_r:.2f} > 3): Low quality expected. SVR/3D sequence recommended.")
     
     if not should_resample:
-        logger.info("Keeping original spacing (isotropic or user requested)")
+        logger.info("Keeping original spacing (isotropic or 2D thick slices)")
         return img_oriented
     
-    # 등방성 리샘플링: iso = max(min(in-plane spacing, 1.0mm), 0.8mm) - 메모리 고려
+    # 등방성 리샘플링: r에 따른 전략
     spacing_array = np.array(img_oriented.GetSpacing())
     in_plane_min = min(spacing_array[0], spacing_array[1])
-    # 최소 0.8mm, 최대 1.0mm로 설정하여 메모리 사용량 제어
-    iso_spacing = min(max(in_plane_min, 0.8), 1.0)
+    
+    if anisotropy_ratio_r <= 1.5:
+        # 거의 등방성: 0.6-0.8mm OK
+        iso_spacing = min(max(in_plane_min, 0.6), 0.8)
+    elif anisotropy_ratio_r <= 3.0:
+        # 중간 이방성: 1.0-1.2mm 권장 (과샘플링 금지)
+        iso_spacing = min(max(in_plane_min, 1.0), 1.2)
+    else:
+        # 높은 이방성: 1.2mm 이상 (메모리 절약)
+        iso_spacing = max(in_plane_min, 1.2)
+        logger.warning(f"⚠️ Very high anisotropy (r={anisotropy_ratio_r:.2f}): Using larger spacing ({iso_spacing}mm) to avoid over-sampling")
+    
     spacing_target = (iso_spacing, iso_spacing, iso_spacing)
-    logger.info(f"Setting isotropic spacing to {iso_spacing}mm (was {in_plane_min}mm in-plane) for memory optimization")
+    logger.info(f"Setting isotropic spacing to {iso_spacing}mm (r={anisotropy_ratio_r:.2f}, was {in_plane_min}mm in-plane)")
     
     size_old = img_oriented.GetSize()
     spacing_old = img_oriented.GetSpacing()
@@ -313,23 +409,53 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
     return img_iso
 
 
-def preprocess_mri_for_surface(img_iso: sitk.Image):
+def preprocess_mri_for_surface(img_iso: sitk.Image, use_n4_bias_correction=True):
     """
-    MRI 이미지 전처리: 윈도잉 → 가우시안 스무딩 → Otsu 임계값 → 연결성 필터
+    MRI 이미지 전처리: N4 bias correction → 윈도잉 → 가우시안 스무딩 → Otsu 임계값 → 연결성 필터
     """
-    arr = sitk.GetArrayFromImage(img_iso).astype(np.float32)  # (z, y, x)
+    # 0) N4 Bias Field Correction (선택적)
+    if use_n4_bias_correction:
+        try:
+            logger.info("Applying N4 bias field correction...")
+            # SimpleITK의 N4BiasFieldCorrectionImageFilter 사용
+            corrector = sitk.N4BiasFieldCorrectionImageFilter()
+            corrector.SetMaximumNumberOfIterations([50, 50, 50, 50])  # 4 levels
+            img_bias_corrected = corrector.Execute(img_iso)
+            logger.info("N4 bias correction completed")
+            img_for_processing = img_bias_corrected
+        except Exception as e:
+            logger.warning(f"N4 bias correction failed: {e}, proceeding without correction")
+            img_for_processing = img_iso
+    else:
+        img_for_processing = img_iso
+    
+    arr = sitk.GetArrayFromImage(img_for_processing).astype(np.float32)  # (z, y, x)
     
     logger.info(f"Original array range: [{arr.min():.1f}, {arr.max():.1f}]")
     
     # 1) Intensity windowing (백분위 기반)
     p1, p99 = np.percentile(arr, (1, 99))
     logger.info(f"Percentiles: 1%={p1:.1f}, 99%={p99:.1f}")
-    arr = np.clip((arr - p1) / max(p99 - p1, 1e-6), 0, 1)
+    arr_windowed = np.clip((arr - p1) / max(p99 - p1, 1e-6), 0, 1)
     
-    # 2) 가우시안 스무딩 (물리 단위, 리샘플 후라면 약 0.8-1.2mm)
-    spacing = np.array(img_iso.GetSpacing())
-    sigma_mm = min(np.mean(spacing), 1.0)  # spacing 평균 또는 1.0mm 중 작은 값
-    smoothed_img = sitk.SmoothingRecursiveGaussian(img_iso, sigma=sigma_mm)
+    # 2) 비등방 가우시안 스무딩 (z 방향만 더 세게)
+    spacing = np.array(img_for_processing.GetSpacing())
+    mean_in_plane = (spacing[0] + spacing[1]) / 2
+    slice_spacing = spacing[2]
+    
+    # 원본 스택이 두꺼운 경우 z 방향 스무딩 강화
+    if slice_spacing > mean_in_plane * 2:
+        # z 방향 스무딩: slice_thickness * 0.4-0.6
+        sigma_z = slice_spacing * 0.5
+        sigma_xy = min(mean_in_plane * 0.8, 1.0)
+        logger.info(f"Anisotropic smoothing: σx=σy={sigma_xy:.3f}mm, σz={sigma_z:.3f}mm (z-direction enhanced)")
+        # SimpleITK는 등방성 스무딩만 지원하므로 가중 평균 사용
+        sigma_mm = np.sqrt((sigma_xy**2 + sigma_xy**2 + sigma_z**2) / 3)
+    else:
+        sigma_mm = min(mean_in_plane * 0.8, 1.0)
+        logger.info(f"Isotropic smoothing: σ={sigma_mm:.3f}mm")
+    
+    smoothed_img = sitk.SmoothingRecursiveGaussian(img_for_processing, sigma=sigma_mm)
     smoothed = sitk.GetArrayFromImage(smoothed_img).astype(np.float32)
     
     # 스무딩된 배열에 윈도잉 적용
@@ -359,6 +485,10 @@ def preprocess_mri_for_surface(img_iso: sitk.Image):
     counts[0] = 0  # 배경 제외
     
     logger.info(f"Found {n_components} connected components")
+    
+    # 성분 수 경고
+    if n_components > 2:
+        logger.warning(f"⚠️ Multiple components ({n_components}): Table/background suspected. Will apply ROI cropping after selection.")
     
     if n_components > 0:
         # 가장 큰 성분 찾기
@@ -422,10 +552,11 @@ def preprocess_mri_for_surface(img_iso: sitk.Image):
     else:
         logger.warning("No components found after labeling")
     
-    # 5) Closing (구멍 메우기)
+    # 5) Closing (구멍 메우기) - 반경 1-2
     mask = ndi.binary_closing(mask, structure=ndi.generate_binary_structure(3, 1))
     
-    logger.info(f"Final mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
+    kept_components = 1 if n_components > 0 else 0
+    logger.info(f"Final mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%), kept_components={kept_components}")
     
     return mask.astype(np.float32)
 
@@ -458,16 +589,17 @@ def mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0
     # 3) (z,y,x) → (x,y,z)로 변환
     verts_xyz = verts_zyx[:, [2, 1, 0]]
     
-    # 4) ⚠️ 중요: spacing은 이미 marching_cubes에서 적용되었으므로 곱하지 않음!
-    # direction & origin만 적용 → LPS 좌표
+    # 4) ⚠️ 중요: spacing은 이미 marching_cubes에서 적용되었으므로 verts_xyz는 이미 mm 단위!
+    # 따라서 추가 곱 없이 direction & origin만 적용 → LPS 좌표 (mm)
     p_lps = (direction @ verts_xyz.T).T + origin
     
-    # 5) LPS → Three.js 좌표 변환
-    # x = R = -L, y = S, z = P
+    # 5) LPS → Three.js 좌표 변환 + mm → m 변환
+    # Three.js 좌표: x = R = -L, y = S, z = P
+    # 단위: mm → m (1/1000)
     p_three = np.column_stack([
-        -p_lps[:, 0],  # R = -L
-        p_lps[:, 2],   # S
-        p_lps[:, 1]    # z = P
+        -p_lps[:, 0] * 0.001,  # R = -L, mm → m
+        p_lps[:, 2] * 0.001,   # S, mm → m
+        p_lps[:, 1] * 0.001    # z = P, mm → m
     ])
     
     logger.info(f"Converted vertices from LPS to Three.js coordinates")
@@ -525,13 +657,39 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
             if not dicom_paths:
                 return {"status": "error", "message": "Failed to download DICOM files"}
             
-            # 각도별 스택 자동 분류 (프로토콜 필터링 포함)
-            stacks = group_stacks_by_orientation(dicom_paths)
+            # Step 1: SeriesInstanceUID별로 그룹화
+            by_series = group_by_series_uid(dicom_paths)
+            
+            if not by_series:
+                return {"status": "error", "message": "No valid series found (missing SeriesInstanceUID)"}
+            
+            # QC 게이트 1: 단일 SeriesInstanceUID만 허용
+            if len(by_series) > 1:
+                series_uids = list(by_series.keys())
+                return {
+                    "status": "error", 
+                    "message": f"Mixed series detected ({len(by_series)} different SeriesInstanceUIDs). Only single series reconstruction supported. Series UIDs: {[uid[:16]+'...' for uid in series_uids]}"
+                }
+            
+            # 단일 Series 선택
+            selected_series_uid = list(by_series.keys())[0]
+            series_files = by_series[selected_series_uid]
+            
+            # QC 게이트 2: Geometry 일관성 검증
+            is_valid, geometry_errors = validate_series_geometry(series_files)
+            if not is_valid:
+                return {
+                    "status": "error",
+                    "message": f"Inconsistent geometry in series {selected_series_uid[:16]}...: {', '.join(geometry_errors[:3])}"
+                }
+            
+            # Step 2: 같은 Series 내에서 orientation별로 스택 분류 (보조)
+            stacks = group_stacks_by_orientation(series_files)
             
             if not stacks:
-                return {"status": "error", "message": "No valid stacks found after grouping"}
+                return {"status": "error", "message": "No valid stacks found after orientation grouping"}
             
-            # 스택 점수화 및 최적 스택 선택
+            # Step 3: 스택 점수화 및 최적 스택 선택
             scored_stacks = []
             for stack in stacks:
                 score, metadata = score_stack_for_3d(stack)
@@ -542,6 +700,13 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
             
             best_score, best_stack, best_metadata = scored_stacks[0]
             
+            # 메타데이터 추출
+            first_ds = best_stack[0][1]
+            rows = getattr(first_ds, 'Rows', None)
+            columns = getattr(first_ds, 'Columns', None)
+            pixel_spacing = getattr(first_ds, 'PixelSpacing', None)
+            
+            logger.info(f"Selected SeriesInstanceUID={selected_series_uid[:32]}... (files={len(best_stack)}, spacing={pixel_spacing}, matrix={rows}x{columns})")
             logger.info(f"Stack selection results:")
             for idx, (score, stack, metadata) in enumerate(scored_stacks[:3]):  # 상위 3개만 로그
                 logger.info(f"  [{idx+1}] Score={score}, Files={len(stack)}, "
@@ -589,10 +754,46 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
                 logger.error(error_msg)
                 return {"status": "error", "message": error_msg}
             
-            # 메쉬 생성 (전처리 및 좌표 변환 포함)
+            # 메쉬 생성 (전처리, ROI 크롭, 좌표 변환 포함)
             try:
-                # step_size=3 권장 (노이즈 감소)
-                mesh = mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0.5, step_size=3)
+                # 메쉬 생성 전 ROI 크롭 적용 (이미지 자체 크롭)
+                image_array = sitk.GetArrayFromImage(img_iso)
+                binary_mask = preprocess_mri_for_surface(img_iso)
+                
+                # 마스크 바운딩박스로 이미지 크롭
+                coords = np.argwhere(binary_mask > 0)
+                if len(coords) > 0:
+                    bbox_min = coords.min(axis=0)
+                    bbox_max = coords.max(axis=0)
+                    margin_voxels = np.array([15, 15, 15]) / np.array(img_iso.GetSpacing())
+                    crop_min = np.maximum(0, (bbox_min - margin_voxels).astype(int))
+                    crop_max = np.minimum(np.array(image_array.shape), (bbox_max + margin_voxels).astype(int))
+                    
+                    # 이미지와 마스크 크롭
+                    image_cropped = image_array[crop_min[0]:crop_max[0], 
+                                                crop_min[1]:crop_max[1], 
+                                                crop_min[2]:crop_max[2]]
+                    mask_cropped = binary_mask[crop_min[0]:crop_max[0], 
+                                              crop_min[1]:crop_max[1], 
+                                              crop_min[2]:crop_max[2]]
+                    
+                    # SimpleITK Image 재생성 (원점 보정)
+                    origin = np.array(img_iso.GetOrigin())
+                    spacing = np.array(img_iso.GetSpacing())
+                    new_origin = origin + (crop_min * spacing)
+                    
+                    img_cropped = sitk.GetImageFromArray(image_cropped)
+                    img_cropped.SetSpacing(img_iso.GetSpacing())
+                    img_cropped.SetOrigin(new_origin)
+                    img_cropped.SetDirection(img_iso.GetDirection())
+                    
+                    logger.info(f"Image cropped: {image_array.shape} → {image_cropped.shape}, new origin: {new_origin}")
+                    
+                    # 크롭된 이미지로 메쉬 생성
+                    mesh = mesh_from_image_with_coordinate_transform(img_cropped, binary_mask=mask_cropped, level=0.5, step_size=3)
+                else:
+                    logger.warning("No mask found for cropping, using full image")
+                    mesh = mesh_from_image_with_coordinate_transform(img_iso, binary_mask=binary_mask, level=0.5, step_size=3)
                 
                 # STL 내보내기
                 stl_buffer = io.BytesIO()
@@ -675,7 +876,7 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
                     "stl_url": stl_obj_name,
                     "gltf_url": gltf_obj_name
                 }
-                
+
             except Exception as e:
                 error_msg = f"Mesh generation failed: {str(e)}"
                 logger.error(error_msg, exc_info=True)

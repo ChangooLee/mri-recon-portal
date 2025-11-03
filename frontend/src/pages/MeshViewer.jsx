@@ -35,13 +35,10 @@ function fitToView(root, camera, controls, opts = { targetSize: 5 }) {
   const center = box.getCenter(new THREE.Vector3())
   const maxDim = Math.max(size.x, size.y, size.z)
 
-  // mm → m 추정(필요 시만): 너무 크면 1/1000 스케일
-  let unitScale = 1
-  if (maxDim > 1000) unitScale = 0.001
-
-  // 원하는 크기(targetSize)에 맞게 스케일
-  const scale = (opts.targetSize ?? 5) / (maxDim * unitScale || 1)
-  pivot.scale.setScalar(scale * unitScale)
+  // 메쉬는 이미 m 단위로 변환됨 (백엔드에서 mm→m 변환 완료)
+  // 따라서 추가 단위 변환 불필요, 바로 스케일만 조정
+  const scale = (opts.targetSize ?? 5) / (maxDim || 1)
+  pivot.scale.setScalar(scale)
 
   // 스케일 후 다시 중심 맞추기
   pivot.updateMatrixWorld(true)
