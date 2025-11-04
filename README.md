@@ -126,27 +126,31 @@ DB는 SQLAlchemy ORM 으로 관리하며 Alembic 마이그레이션을 지원합
 
 ## 🧠 Reconstruction Pipeline
 
-### 개선된 DICOM → 3D 메쉬 파이프라인
+### 모듈화된 다평면 MRI → 3D 메쉬 파이프라인 (v2.0)
+
+**새로운 구조**: `backend/app/processing/` 모듈화된 파이프라인
 
 1️⃣ **DICOM 업로드 및 시리즈 선택**
    - SeriesInstanceUID별 자동 그룹화
-   - 혼합 시리즈 감지 시 가장 큰 시리즈 자동 선택
+   - **다평면 지원**: 여러 시리즈 자동 감지 및 정합 준비
    - Geometry 일관성 검증 (Rows/Columns/PixelSpacing)
 
-2️⃣ **IPP 기반 정렬 및 Outlier 제거**
-   - ImagePositionPatient 기반 정확한 슬라이스 정렬
-   - 비정상 간격 슬라이스 자동 제거 (Δt 변동계수 기반)
+2️⃣ **다평면 정합 및 융합** ⭐ **신규**
+   - Rigid Registration (Mattes Mutual Information)
+   - 다평면 스택을 기준 볼륨에 정합
+   - Max fusion으로 등방 볼륨 생성
+   - 초해상 옵션 (NiftyMIC/SVRTK 지원, 선택적)
 
 3️⃣ **고급 전처리**
    - N4 Bias Field Correction (MRI 신호 불균일 보정)
-   - 비등방 가우시안 스무딩 (z 방향 강화)
-   - Intensity windowing → 3D Otsu 임계값
-   - 연결성 필터링 (최대 성분 선택, 중심 기반 스코링)
+   - CurvatureFlow 기반 바디마스크 (배경 슬랩 제거)
+   - 등방성 리샘플링 (target_spacing 옵션)
+   - 연결성 필터링 (최대 성분 선택)
 
-4️⃣ **스마트 리샘플링**
-   - 이방성 비율(r) 기반 자동 전략
-   - 2D 두꺼운 슬라이스(≥3mm) 감지 시 원본 해상도 유지
-   - 등방성 리샘플링: r ≤ 1.5 → 0.6-0.8mm, r ≤ 3.0 → 1.0-1.2mm
+4️⃣ **조직별 세그멘테이션** ⭐ **신규**
+   - **뼈 마스크**: 경사도(gradient) 기반 (상위 15% 경계)
+   - **근육 마스크**: K-means 3클러스터 (지방/근육/수분 분리)
+   - 형태학적 정제 (작은 파편 제거, closing)
 
 5️⃣ **Marching Cubes 및 좌표 변환**
    - Spacing 이중 적용 버그 수정
@@ -154,13 +158,13 @@ DB는 SQLAlchemy ORM 으로 관리하며 Alembic 마이그레이션을 지원합
    - 단위 일원화: mm → m (1/1000)
 
 6️⃣ **메쉬 후처리**
-   - Laplacian smoothing
-   - Quadratic decimation (30-60%)
-   - ROI 크롭 (배경/테이블 제거)
+   - 퇴화된 면/미사용 정점 제거
+   - 가장 큰 연결 컴포넌트 선택
+   - Quadratic decimation (50%)
+   - 여러 조직 메쉬 통합
 
 7️⃣ **결과 저장 및 시각화**
    - STL/GLB 형식 내보내기
-   - Draco 압축 지원
    - Three.js 기반 3D 뷰어 (자동 카메라 맞춤)
    - DICOM 슬라이스 뷰어 (윈도잉 기능)
 
@@ -253,14 +257,21 @@ docker compose exec backend alembic upgrade head
 | Phase 3 | PACS 연동 및 결과 검색            | 🔄 향후 계획 |
 | Phase 4 | K8s + GPU 스케일링 배포          | 🔄 향후 계획 |
 
-### 주요 개선사항 (v1.2)
+### 주요 개선사항 (v2.0)
 
-- ✅ **SeriesInstanceUID 자동 선택**: 혼합 시리즈 감지 시 가장 큰 시리즈 자동 선택
-- ✅ **IPP 기반 정렬**: ImagePositionPatient 기반 정확한 슬라이스 정렬 및 outlier 제거
-- ✅ **N4 Bias Correction**: MRI 신호 불균일 보정으로 전처리 품질 향상
-- ✅ **스마트 리샘플링**: 이방성 비율 기반 자동 전략 (가짜 구조 방지)
+- ✅ **모듈화된 파이프라인**: `backend/app/processing/` 구조로 재구성
+- ✅ **다평면 정합/융합**: 여러 시리즈를 정합하여 등방 볼륨 생성 (rigid registration + max fusion)
+- ✅ **조직별 세그멘테이션**: 경사도 기반 뼈 마스크 + K-means 기반 근육 마스크
+- ✅ **CurvatureFlow 바디마스크**: 배경 슬랩 자동 제거
+- ✅ **초해상 옵션**: NiftyMIC/SVRTK 감지 시 자동 사용 (선택적)
 - ✅ **좌표 변환 개선**: Spacing 이중 적용 버그 수정, mm → m 단위 일원화
-- ✅ **3D 뷰어 개선**: 자동 카메라 맞춤, 원점 정렬, Draco 압축 지원
+- ✅ **3D 뷰어 개선**: 자동 카메라 맞춤, 원점 정렬
+
+**기존 기능 유지:**
+- ✅ SeriesInstanceUID 자동 선택
+- ✅ IPP 기반 정렬 및 outlier 제거
+- ✅ N4 Bias Correction
+- ✅ 스마트 리샘플링
 
 ## 🔧 개발 및 테스트
 

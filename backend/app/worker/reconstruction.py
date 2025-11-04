@@ -1,6 +1,6 @@
 import SimpleITK as sitk
 import numpy as np
-from skimage import measure
+from skimage import measure, morphology
 from skimage.filters import threshold_otsu
 from scipy import ndimage as ndi
 import trimesh
@@ -400,156 +400,128 @@ def read_volume_sorted(stack_files, keep_original_spacing=None):
     return img_iso
 
 
-def preprocess_mri_for_surface(img_iso: sitk.Image, use_n4_bias_correction=True):
+def create_body_mask(img_iso: sitk.Image):
     """
-    MRI 이미지 전처리: N4 bias correction → 윈도잉 → 가우시안 스무딩 → Otsu 임계값 → 연결성 필터
+    CurvatureFlow 기반 바디마스크 생성
+    부드럽게 → Otsu → 가장 큰 연결요소만 남김
+    """
+    logger.info("Creating body mask using CurvatureFlow...")
+    # CurvatureFlow로 부드럽게 (경계 보존하면서 노이즈 제거)
+    smoothed = sitk.CurvatureFlow(img_iso, timeStep=0.125, numberOfIterations=5)
+    
+    # Otsu 임계값으로 바디 마스크 생성
+    try:
+        body_mask = sitk.OtsuThreshold(smoothed, 0, 1, 200)
+        logger.info(f"Otsu body mask created")
+    except Exception as e:
+        logger.warning(f"Otsu threshold failed: {e}, using median threshold")
+        arr = sitk.GetArrayFromImage(smoothed)
+        median_threshold = np.median(arr)
+        body_mask = sitk.BinaryThreshold(smoothed, median_threshold, 1e9, 1, 0)
+    
+    # Morphological closing으로 구멍 메우기
+    body_mask = sitk.BinaryMorphologicalClosing(body_mask, [2, 2, 2])
+    
+    # Connected component로 가장 큰 성분만 남기기
+    cc = sitk.ConnectedComponent(body_mask)
+    relabeled = sitk.RelabelComponent(cc, sortByObjectSize=True)
+    body_mask = sitk.BinaryThreshold(relabeled, 1, 1)
+    
+    body_mask_arr = sitk.GetArrayFromImage(body_mask).astype(bool)
+    logger.info(f"Body mask: {np.sum(body_mask_arr)} / {body_mask_arr.size} pixels ({100*np.sum(body_mask_arr)/body_mask_arr.size:.1f}%)")
+    
+    return body_mask_arr
+
+
+def create_bone_mask(img_iso: sitk.Image, body_mask):
+    """
+    경사도(gradient) 기반 뼈 마스크 생성
+    MRI에서 뼈는 검은 테두리(피질골)로 보이므로 경계강도 기반으로 추출
+    """
+    logger.info("Creating bone mask using gradient magnitude...")
+    
+    # Gradient magnitude 계산 (경계강도)
+    gradient = sitk.GradientMagnitudeRecursiveGaussian(img_iso, sigma=1.0)
+    gradient_arr = sitk.GetArrayFromImage(gradient)
+    
+    # 바디 안쪽 영역만 고려
+    gradient_in_body = gradient_arr.copy()
+    gradient_in_body[~body_mask] = 0
+    
+    # 상위 15% 경계만 선택 (뼈 경계는 강한 경사도를 가짐)
+    non_zero_gradients = gradient_in_body[gradient_in_body > 0]
+    if len(non_zero_gradients) > 0:
+        threshold_percentile = np.percentile(non_zero_gradients, 85)
+        logger.info(f"Gradient threshold (85th percentile): {threshold_percentile:.3f}")
+        
+        bone_mask = (gradient_in_body >= threshold_percentile) & body_mask
+    else:
+        logger.warning("No gradients found in body mask, using fallback")
+        bone_mask = body_mask.copy()
+    
+    # 3D 형태학으로 다듬기
+    # 작은 파편 제거 (5000 voxel 이하)
+    bone_mask = morphology.remove_small_objects(bone_mask, min_size=5000)
+    # Closing으로 경계 부드럽게
+    bone_mask = morphology.binary_closing(bone_mask, morphology.ball(2))
+    
+    bone_voxels = np.sum(bone_mask)
+    logger.info(f"Bone mask: {bone_voxels} / {bone_mask.size} pixels ({100*bone_voxels/bone_mask.size:.1f}%)")
+    
+    return bone_mask.astype(np.float32)
+
+
+def preprocess_mri_for_surface(img_iso: sitk.Image, use_n4_bias_correction=True, mask_type='body'):
+    """
+    MRI 이미지 전처리: N4 bias correction → 바디마스크 → 경사도 기반 뼈 마스크
+    mask_type: 'body' (바디 전체) 또는 'bone' (경사도 기반 뼈만)
     """
     # 0) N4 Bias Field Correction (선택적)
     if use_n4_bias_correction:
         try:
             logger.info("Applying N4 bias field correction...")
-            # SimpleITK의 N4BiasFieldCorrectionImageFilter 사용
+            
+            # N4 필터는 float 타입을 요구하므로 픽셀 타입 변환
+            pixel_id = img_iso.GetPixelID()
+            if pixel_id != sitk.sitkFloat32:
+                try:
+                    pixel_type_str = sitk.GetPixelIDTypeAsString(pixel_id)
+                    logger.info(f"Converting pixel type from {pixel_type_str} to Float32 for N4 bias correction")
+                except AttributeError:
+                    logger.info(f"Converting pixel type (ID: {pixel_id}) to Float32 for N4 bias correction")
+                img_for_n4 = sitk.Cast(img_iso, sitk.sitkFloat32)
+            else:
+                img_for_n4 = img_iso
+            
+            # Otsu로 거친 바디마스크 생성 (N4에 필요)
+            rough_body = sitk.OtsuThreshold(img_for_n4, 0, 1, 200)
             corrector = sitk.N4BiasFieldCorrectionImageFilter()
             corrector.SetMaximumNumberOfIterations([50, 50, 50, 50])  # 4 levels
-            img_bias_corrected = corrector.Execute(img_iso)
+            img_bias_corrected = corrector.Execute(img_for_n4, rough_body)
             logger.info("N4 bias correction completed")
             img_for_processing = img_bias_corrected
         except Exception as e:
             logger.warning(f"N4 bias correction failed: {e}, proceeding without correction")
-            img_for_processing = img_iso
+            # float로 변환된 이미지가 있으면 사용, 없으면 원본 사용
+            if 'img_for_n4' in locals():
+                img_for_processing = img_for_n4
+            else:
+                img_for_processing = img_iso
     else:
         img_for_processing = img_iso
     
-    arr = sitk.GetArrayFromImage(img_for_processing).astype(np.float32)  # (z, y, x)
+    # 1) 바디마스크 생성 (CurvatureFlow 기반)
+    body_mask = create_body_mask(img_for_processing)
     
-    logger.info(f"Original array range: [{arr.min():.1f}, {arr.max():.1f}]")
-    
-    # 1) Intensity windowing (백분위 기반)
-    p1, p99 = np.percentile(arr, (1, 99))
-    logger.info(f"Percentiles: 1%={p1:.1f}, 99%={p99:.1f}")
-    arr_windowed = np.clip((arr - p1) / max(p99 - p1, 1e-6), 0, 1)
-    
-    # 2) 비등방 가우시안 스무딩 (z 방향만 더 세게)
-    spacing = np.array(img_for_processing.GetSpacing())
-    mean_in_plane = (spacing[0] + spacing[1]) / 2
-    slice_spacing = spacing[2]
-    
-    # 원본 스택이 두꺼운 경우 z 방향 스무딩 강화
-    if slice_spacing > mean_in_plane * 2:
-        # z 방향 스무딩: slice_thickness * 0.4-0.6
-        sigma_z = slice_spacing * 0.5
-        sigma_xy = min(mean_in_plane * 0.8, 1.0)
-        logger.info(f"Anisotropic smoothing: σx=σy={sigma_xy:.3f}mm, σz={sigma_z:.3f}mm (z-direction enhanced)")
-        # SimpleITK는 등방성 스무딩만 지원하므로 가중 평균 사용
-        sigma_mm = np.sqrt((sigma_xy**2 + sigma_xy**2 + sigma_z**2) / 3)
+    # 2) 마스크 타입에 따라 선택
+    if mask_type == 'bone':
+        # 경사도 기반 뼈 마스크
+        final_mask = create_bone_mask(img_for_processing, body_mask)
     else:
-        sigma_mm = min(mean_in_plane * 0.8, 1.0)
-        logger.info(f"Isotropic smoothing: σ={sigma_mm:.3f}mm")
+        # 바디 마스크만 사용
+        final_mask = body_mask.astype(np.float32)
     
-    smoothed_img = sitk.SmoothingRecursiveGaussian(img_for_processing, sigma=sigma_mm)
-    smoothed = sitk.GetArrayFromImage(smoothed_img).astype(np.float32)
-    
-    # 스무딩된 배열에 윈도잉 적용
-    p1_smooth, p99_smooth = np.percentile(smoothed, (1, 99))
-    smoothed_windowed = np.clip((smoothed - p1_smooth) / max(p99_smooth - p1_smooth, 1e-6), 0, 1)
-    
-    logger.info(f"After smoothing (σ={sigma_mm}mm): range=[{smoothed_windowed.min():.3f}, {smoothed_windowed.max():.3f}]")
-    
-    # 3) 3D Otsu 임계값
-    try:
-        t = threshold_otsu(smoothed_windowed)
-        logger.info(f"Otsu threshold: {t:.3f}")
-        mask = smoothed_windowed > t
-    except Exception as e:
-        logger.warning(f"Otsu threshold failed: {e}, using median")
-        t = np.median(smoothed_windowed)
-        mask = smoothed_windowed > t
-    
-    logger.info(f"Binary mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%)")
-    
-    # 4) 작은 덩어리 제거 + 연결성 분석
-    structure = ndi.generate_binary_structure(3, 2)
-    mask = ndi.binary_opening(mask, structure=structure)
-    
-    lbl, n_components = ndi.label(mask)
-    counts = np.bincount(lbl.ravel())
-    counts[0] = 0  # 배경 제외
-    
-    logger.info(f"Found {n_components} connected components")
-    
-    # 성분 수 경고
-    if n_components > 2:
-        logger.warning(f"⚠️ Multiple components ({n_components}): Table/background suspected. Will apply ROI cropping after selection.")
-    
-    if n_components > 0:
-        # 가장 큰 성분 찾기
-        largest_idx = np.argmax(counts)
-        largest_size = counts[largest_idx]
-        
-        # 메모리 절약: 작은 컴포넌트는 즉시 제외 (최대 성분의 1% 미만)
-        min_size_threshold = largest_size * 0.01
-        
-        # 중심부에 가까운 성분 우선 선택 (외곽 테이블/코일 제외)
-        center = np.array(arr.shape) / 2
-        best_component = largest_idx
-        best_score = largest_size
-        
-        # 최대 성분의 30% 이상인 것만 고려 (메모리 절약)
-        for comp_id in range(1, len(counts)):
-            if counts[comp_id] < largest_size * 0.3:
-                continue
-            if counts[comp_id] < min_size_threshold:
-                continue
-            
-            # 무게중심 계산 (메모리 효율적: 샘플링)
-            comp_mask = (lbl == comp_id)
-            # 모든 좌표를 저장하지 않고 샘플링하여 메모리 절약
-            comp_coords = np.argwhere(comp_mask)
-            if len(comp_coords) == 0:
-                continue
-            
-            # 너무 많은 좌표면 샘플링
-            if len(comp_coords) > 100000:
-                step = len(comp_coords) // 50000
-                comp_coords = comp_coords[::step]
-            
-            centroid = comp_coords.mean(axis=0)
-            dist_to_center = np.linalg.norm(centroid - center)
-            
-            # 점수: 크기 - 중심으로부터의 거리 (정규화)
-            max_dist = np.linalg.norm(center)
-            normalized_dist = dist_to_center / max_dist if max_dist > 0 else 1.0
-            score = counts[comp_id] * (1.0 - normalized_dist * 0.3)  # 거리 페널티 30%
-            
-            if score > best_score:
-                best_score = score
-                best_component = comp_id
-                logger.info(f"Component {comp_id} closer to center: size={counts[comp_id]}, dist={dist_to_center:.1f}, score={score:.0f}")
-        
-        keep = best_component
-        logger.info(f"Keeping component: {keep} (size={counts[keep]} voxels, score={best_score:.0f})")
-        mask = (lbl == keep)
-        
-        # 작은 컴포넌트 정리 (메모리 해제)
-        del lbl, counts
-        
-        # 컴포넌트 바운딩 박스 로그
-        coords = np.argwhere(mask)
-        if len(coords) > 0:
-            bbox_min = coords.min(axis=0)
-            bbox_max = coords.max(axis=0)
-            bbox_size = bbox_max - bbox_min
-            logger.info(f"Bounding box: min={bbox_min}, max={bbox_max}, size={bbox_size}")
-    else:
-        logger.warning("No components found after labeling")
-    
-    # 5) Closing (구멍 메우기) - 반경 1-2
-    mask = ndi.binary_closing(mask, structure=ndi.generate_binary_structure(3, 1))
-    
-    kept_components = 1 if n_components > 0 else 0
-    logger.info(f"Final mask: {np.sum(mask)} / {mask.size} pixels ({100*np.sum(mask)/mask.size:.1f}%), kept_components={kept_components}")
-    
-    return mask.astype(np.float32)
+    return final_mask
 
 
 def mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0.5, step_size=2):
@@ -605,7 +577,34 @@ def mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0
     mesh = trimesh.Trimesh(vertices=p_three, faces=faces, vertex_normals=normals, process=False)
     logger.info(f"Mesh created: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     
-    # 7) 메시 스무딩/간소화 (후처리)
+    # 7) 메쉬 정리: 퇴화된 면/미사용 정점 제거
+    try:
+        mesh.remove_degenerate_faces()
+        mesh.remove_unreferenced_vertices()
+        logger.info(f"After cleanup: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    except Exception as e:
+        logger.warning(f"Mesh cleanup failed: {e}")
+    
+    # 8) 작은 연결요소 제거 (파편 제거)
+    try:
+        logger.info("Removing small connected components...")
+        comps = mesh.split(only_watertight=False)
+        # 체적이 있는 컴포넌트 우선 (watertight 메쉬)
+        comps_with_volume = [c for c in comps if c.is_volume and c.volume > 0]
+        if comps_with_volume:
+            # 가장 큰 컴포넌트 선택
+            mesh = max(comps_with_volume, key=lambda c: c.volume)
+            logger.info(f"Kept largest component with volume: {mesh.volume:.1f}")
+        else:
+            # 체적이 없으면 면 수 기준으로 선택
+            mesh = max(comps, key=lambda c: len(c.faces))
+            logger.info(f"Kept largest component by face count: {len(mesh.faces)} faces")
+        
+        logger.info(f"After component filtering: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    except Exception as e:
+        logger.warning(f"Component filtering failed: {e}")
+    
+    # 9) 메시 스무딩/간소화 (후처리)
     try:
         logger.info("Applying Laplacian smoothing...")
         trimesh.smoothing.filter_laplacian(mesh, iterations=5, lamb=0.5)
@@ -623,7 +622,27 @@ def mesh_from_image_with_coordinate_transform(img_iso, binary_mask=None, level=0
 
 
 def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
-    """DICOM 파일을 읽어서 3D 메쉬로 변환 (개선된 파이프라인)"""
+    """
+    DICOM 파일을 읽어서 3D 메쉬로 변환
+    
+    이제 새로운 모듈화된 파이프라인을 사용합니다.
+    기존 로직은 유지하되, 새로운 파이프라인을 기본으로 사용합니다.
+    """
+    # 새로운 파이프라인 사용 (다평면 지원)
+    from app.worker.reconstruction_v2 import process_dicom_to_mesh_v2
+    
+    # 다평면 정합 사용 (여러 시리즈가 있으면 정합/융합)
+    return process_dicom_to_mesh_v2(
+        reconstruction=reconstruction,
+        db=db,
+        tissues=['bone'],  # 기본값: 뼈만 (근육 추가 시 ['bone', 'muscle'])
+        use_multi_plane=True,  # 다평면 정합 활성화
+        target_spacing=1.0  # 등방성 간격
+    )
+
+
+def process_dicom_to_mesh_legacy(reconstruction: Reconstruction, db: Session) -> dict:
+    """DICOM 파일을 읽어서 3D 메쉬로 변환 (기존 파이프라인 - 레거시)"""
     try:
         dicom_files = reconstruction.dicom_url.split(",")
         logger.info(f"Processing {len(dicom_files)} DICOM file(s) for reconstruction {reconstruction.id}")
@@ -654,16 +673,27 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
             if not by_series:
                 return {"status": "error", "message": "No valid series found (missing SeriesInstanceUID)"}
             
-            # QC 게이트 1: 단일 SeriesInstanceUID만 허용
+            # QC 게이트 1: 여러 SeriesInstanceUID가 있는 경우 가장 큰 그룹 선택
             if len(by_series) > 1:
                 series_uids = list(by_series.keys())
-                return {
-                    "status": "error", 
-                    "message": f"Mixed series detected ({len(by_series)} different SeriesInstanceUIDs). Only single series reconstruction supported. Series UIDs: {[uid[:16]+'...' for uid in series_uids]}"
-                }
+                series_sizes = {uid: len(files) for uid, files in by_series.items()}
+                
+                # 가장 큰 시리즈 선택
+                selected_series_uid = max(series_sizes, key=series_sizes.get)
+                selected_size = series_sizes[selected_series_uid]
+                total_files = sum(series_sizes.values())
+                
+                logger.warning(f"Mixed series detected ({len(by_series)} different SeriesInstanceUIDs). "
+                             f"Selecting largest series: {selected_series_uid[:32]}... "
+                             f"({selected_size}/{total_files} files, {100*selected_size/total_files:.1f}%)")
+                logger.warning(f"Other series will be ignored. Series UIDs: {[uid[:16]+'...' for uid in series_uids[:5]]}...")
+                
+                # 사용자에게 경고 메시지 제공 (하지만 계속 진행)
+                # return {"status": "error", ...} 대신 경고만 로그하고 진행
+            else:
+                selected_series_uid = list(by_series.keys())[0]
             
-            # 단일 Series 선택
-            selected_series_uid = list(by_series.keys())[0]
+            # 선택된 Series 사용
             series_files = by_series[selected_series_uid]
             
             # QC 게이트 2: Geometry 일관성 검증
@@ -751,7 +781,7 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
                 image_array = sitk.GetArrayFromImage(img_iso)
                 binary_mask = preprocess_mri_for_surface(img_iso)
                 
-                # 마스크 바운딩박스로 이미지 크롭
+                # 마스크 바운딩박스로 이미지 크롭 (배경 슬랩 제거)
                 coords = np.argwhere(binary_mask > 0)
                 if len(coords) > 0:
                     bbox_min = coords.min(axis=0)
@@ -780,7 +810,7 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
                     
                     logger.info(f"Image cropped: {image_array.shape} → {image_cropped.shape}, new origin: {new_origin}")
                     
-                    # 크롭된 이미지로 메쉬 생성
+                    # 크롭된 이미지로 메쉬 생성 (bone 마스크 사용)
                     mesh = mesh_from_image_with_coordinate_transform(img_cropped, binary_mask=mask_cropped, level=0.5, step_size=3)
                 else:
                     logger.warning("No mask found for cropping, using full image")
