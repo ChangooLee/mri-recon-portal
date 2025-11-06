@@ -12,10 +12,10 @@ import numpy as np
 import logging
 
 from .io import list_series, load_series_by_files
-from .preprocess import n4_bias, to_isotropic, body_mask
+from .preprocess import n4_bias, to_isotropic, body_mask, resample_to_spacing
 from .register import rigid_register, fuse_max
-from .segment import edge_mask, muscle_mask
-from .mesh import mask_to_mesh, export_meshes
+from .segment import edge_mask, muscle_mask, segment_bone_25d
+from .mesh import mask_to_mesh, export_meshes, mesh_from_mask
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ class TissueOption(str):
 @dataclass
 class ReconOptions:
     """재구성 옵션"""
-    target_spacing: float = 1.0  # 등방성 리샘플 간격 (mm)
+    target_spacing: float = 1.2  # 등방성 리샘플 간격 (mm, 1.0-1.2 권장)
     tissues: List[str] = None  # ['bone', 'muscle']
     use_superres: bool = False  # 초해상 재구성 사용 여부
     output_dir: Optional[Path] = None
@@ -36,7 +36,7 @@ class ReconOptions:
     
     def __post_init__(self):
         if self.tissues is None:
-            self.tissues = ['bone', 'muscle']
+            self.tissues = ['bone']
 
 
 def _try_superres(niftis: List[Path], spacing: float, out_vol: Path) -> bool:
@@ -236,22 +236,61 @@ def run_reconstruction(
             logger.warning(f"Super-resolution pipeline failed: {e}")
             log.append(f"Super-resolution failed: {e}")
     
-    # 4) 조직별 마스크
-    bmask = body_mask(fused)
+    # 4) 조직별 마스크 (2.5D 세그멘테이션 강제 + 마스크만 등방 업샘플)
     meshes = []
     
     if "bone" in opts.tissues:
         try:
-            bone = edge_mask(fused, bmask)
-            bone_mesh = mask_to_mesh(bone)
-            meshes.append(bone_mesh)
-            log.append("Bone mask -> mesh complete")
+            # === 2.5D 세그멘테이션 강제 파이프라인 ===
+            import os
+            force_25d = os.getenv("FORCE_25D", "1") != "0"
+            
+            # 원본 spacing 확인
+            orig_spacing = fused.GetSpacing()  # (x, y, z) - SimpleITK 순서
+            if len(orig_spacing) == 3:
+                sz = orig_spacing[2]  # z 간격
+                logger.info(f"PIPELINE: 2.5D segmentation enforced={force_25d} (z={sz:.2f}mm)")
+                
+                # 1) 세그멘트 전용 준등방 리샘플 (2.5D): in-plane만 고해상, z는 억제
+                seg_spacing_z = min(sz, 3.0)
+                seg_spacing = (0.8, 0.8, seg_spacing_z)  # (x, y, z)
+                logger.info(f"Segmentation spacing (2.5D): {seg_spacing}")
+                vol_seg = resample_to_spacing(fused, seg_spacing, order=1)  # 선형
+                
+                # 2) 2.5D 슬라이스-연속성 기반 세그멘트
+                vol_arr = sitk.GetArrayFromImage(vol_seg).astype(np.float32)
+                # 정규화 (0..1)
+                vol_arr = (vol_arr - vol_arr.min()) / (vol_arr.max() - vol_arr.min() + 1e-6)
+                bone_mask_25d = segment_bone_25d(vol_arr, logger=logger)
+                
+                # 3) 메싱 직전에만 등방 업샘플(마스크만, 최근접)
+                iso_spacing = (opts.target_spacing, opts.target_spacing, opts.target_spacing)
+                bone_mask_25d_sitk = sitk.GetImageFromArray(bone_mask_25d.astype(np.uint8))
+                bone_mask_25d_sitk.CopyInformation(vol_seg)
+                bone_mask_iso = resample_to_spacing(bone_mask_25d_sitk, iso_spacing, order=0)  # Nearest
+                bone_mask_arr = sitk.GetArrayFromImage(bone_mask_iso).astype(bool)
+                
+                # 4) 메싱: 얇은 피질 보존(step_size=1)
+                bone_mesh, stats = mesh_from_mask(bone_mask_arr, iso_spacing, logger=logger)
+                meshes.append(bone_mesh)
+                log.append(f"Bone mask (2.5D) -> mesh complete: {stats['faces']:,} faces")
+            else:
+                # fallback
+                logger.warning("Invalid spacing, using fallback 3D segmentation")
+                bmask = body_mask(fused)
+                bone = edge_mask(fused, bmask)
+                bone_mesh = mask_to_mesh(bone)
+                meshes.append(bone_mesh)
+                log.append("Bone mask -> mesh complete")
         except Exception as e:
             logger.error(f"Bone segmentation failed: {e}", exc_info=True)
             log.append(f"Bone segmentation failed: {e}")
     
     if "muscle" in opts.tissues:
         try:
+            # muscle_mask는 body_mask가 필요
+            if 'bmask' not in locals():
+                bmask = body_mask(fused)
             mus = muscle_mask(fused, bmask)
             muscle_mesh = mask_to_mesh(mus)
             meshes.append(muscle_mesh)

@@ -22,8 +22,8 @@ def process_dicom_to_mesh_v2(
     reconstruction: Reconstruction, 
     db: Session,
     tissues: list = None,
-    use_multi_plane: bool = True,
-    target_spacing: float = 1.0
+    use_multi_plane: bool = False,  # 기본값: 단일 시리즈 우선 (가이드 권장)
+    target_spacing: float = 1.2  # 등방성 간격 (1.0-1.2mm 권장)
 ) -> dict:
     """
     새로운 재구성 파이프라인 (다평면 지원)
@@ -105,12 +105,74 @@ def process_dicom_to_mesh_v2(
             logger.info(f"Found {len(series_groups)} series: {[uid[:16]+'...' for uid in series_groups.keys()]}")
             
             # 가이드: 단일 시리즈 우선 처리 (안정적인 기본 파이프라인)
-            # OOM 방지: 큰 데이터셋(200개 이상 파일)은 자동으로 단일 시리즈만 사용
+            # OOM 방지: 큰 데이터셋 또는 여러 시리즈는 자동으로 단일 시리즈만 사용
             total_files = sum(len(files) for files in series_groups.values())
-            if use_multi_plane and len(series_groups) > 1 and total_files > 200:
-                logger.warning(f"Large dataset detected ({total_files} files, {len(series_groups)} series). "
+            num_series = len(series_groups)
+            
+            # OOM 방지 조건: 200개 이상 파일 OR 3개 이상 시리즈
+            if use_multi_plane and num_series > 1 and (total_files > 200 or num_series >= 3):
+                logger.warning(f"Large dataset detected ({total_files} files, {num_series} series). "
                              f"Using single series to avoid OOM. Multi-plane registration disabled.")
                 use_multi_plane = False
+            
+            # 시리즈 메타데이터 수집 (z-spacing 우선 선택용)
+            import pydicom
+            series_meta = {}
+            for uid, files in series_groups.items():
+                try:
+                    # 첫 번째 파일로 메타데이터 확인
+                    ds = pydicom.dcmread(files[0], stop_before_pixels=True)
+                    spacing = getattr(ds, 'PixelSpacing', [1.0, 1.0])
+                    if hasattr(ds, 'SliceThickness') and ds.SliceThickness:
+                        z_spacing = float(ds.SliceThickness)
+                    elif hasattr(ds, 'SpacingBetweenSlices') and ds.SpacingBetweenSlices:
+                        z_spacing = float(ds.SpacingBetweenSlices)
+                    else:
+                        # ImagePositionPatient로 계산 (간단한 추정)
+                        z_spacing = 4.0  # fallback
+                    series_meta[uid] = {
+                        'slices': len(files),
+                        'z_spacing': z_spacing,
+                        'pixel_spacing': spacing
+                    }
+                    logger.info(f"Series {uid[:16]}...: slices={len(files)}, z={z_spacing:.2f}mm, pixel={spacing}")
+                except Exception as e:
+                    logger.warning(f"Failed to read metadata for series {uid[:16]}...: {e}")
+                    series_meta[uid] = {'slices': len(files), 'z_spacing': 9.9, 'pixel_spacing': [1.0, 1.0]}
+            
+            # 시리즈 선택: z-spacing 우선 (작을수록 좋음), 슬라이스 수 하한
+            def choose_primary_series(series_groups, series_meta, logger):
+                """z-spacing이 작고 슬라이스 수가 많은 시리즈 우선 선택"""
+                import os
+                force_uid = os.getenv("FORCE_SERIES_UID")
+                if force_uid and force_uid in series_groups:
+                    logger.warning(f"FORCE_SERIES_UID set. Using {force_uid} regardless of heuristics.")
+                    return force_uid
+                
+                cand = []
+                for uid, files in series_groups.items():
+                    meta = series_meta.get(uid, {})
+                    z = meta.get('z_spacing', 9.9)
+                    n = meta.get('slices', len(files))
+                    cand.append((uid, n, z))
+                
+                cand.sort(key=lambda x: (x[2], -x[1]))  # z 오름차순, 슬라이스수 내림차순
+                
+                def pick(min_z, min_n):
+                    for uid, n, z in cand:
+                        if z <= min_z and n >= min_n:
+                            return uid, n, z
+                    return None
+                
+                picked = pick(2.2, 40) or pick(3.5, 30)
+                if picked:
+                    uid, n, z = picked
+                    logger.info(f"Selected by spacing: uid={uid[:16]}..., slices={n}, z={z:.2f}mm")
+                    return uid
+                
+                uid, n, z = max(cand, key=lambda t: t[1])
+                logger.warning(f"No fine spacing series; fallback to largest: uid={uid[:16]}..., slices={n}, z={z:.2f}mm")
+                return uid
             
             # 3) 다평면 처리 또는 단일 시리즈 처리
             if use_multi_plane and len(series_groups) > 1:
@@ -143,24 +205,24 @@ def process_dicom_to_mesh_v2(
                 result = run_reconstruction(series_dirs, opts, temp_dir=temp_path)
                 
             else:
-                # 단일 시리즈 처리 (가장 큰 시리즈 선택)
-                logger.info("Using single series (largest) processing")
+                # 단일 시리즈 처리 (z-spacing 우선 선택)
+                logger.info("Using single series (z-spacing priority) processing")
                 
-                # 가장 큰 시리즈 선택
-                largest_series_uid = max(series_groups.keys(), key=lambda k: len(series_groups[k]))
-                largest_files = series_groups[largest_series_uid]
+                selected_series_uid = choose_primary_series(series_groups, series_meta, logger)
+                selected_files = series_groups[selected_series_uid]
                 
                 if len(series_groups) > 1:
-                    logger.warning(f"Multiple series detected ({len(series_groups)}), selecting largest: {largest_series_uid[:16]}... "
-                                 f"({len(largest_files)}/{sum(len(f) for f in series_groups.values())} files) "
-                                 f"[OOM 방지: 단일 시리즈만 사용]")
+                    meta_info = series_meta.get(selected_series_uid, {})
+                    logger.info(f"Selected series: {selected_series_uid[:16]}... "
+                             f"({len(selected_files)}/{sum(len(f) for f in series_groups.values())} files, "
+                             f"z={meta_info.get('z_spacing', 0):.2f}mm, slices={len(selected_files)})")
                 
                 # 단일 시리즈 디렉터리 구성
                 series_dir = temp_path / "series_single"
                 series_dir.mkdir(parents=True, exist_ok=True)
                 
                 import shutil
-                for f in largest_files:
+                for f in selected_files:
                     shutil.copy(f, series_dir / os.path.basename(f))
                 
                 opts = ReconOptions(

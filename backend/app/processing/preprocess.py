@@ -49,14 +49,14 @@ def n4_bias(img: sitk.Image) -> sitk.Image:
         return img_float
 
 
-def to_isotropic(img: sitk.Image, iso: float = 1.0) -> sitk.Image:
+def to_isotropic(img: sitk.Image, iso: float = 1.2) -> sitk.Image:
     """
-    등방성 리샘플링
+    등방성 리샘플링 (1.0-1.2mm 권장)
     방향/원점/간격 메타데이터 엄격히 보존
     
     Args:
         img: 입력 이미지
-        iso: 목표 등방성 간격 (mm)
+        iso: 목표 등방성 간격 (mm, 기본 1.2mm)
         
     Returns:
         sitk.Image: 등방성 리샘플된 이미지
@@ -78,6 +78,7 @@ def to_isotropic(img: sitk.Image, iso: float = 1.0) -> sitk.Image:
     res.SetSize(new_sz)
     res.SetOutputDirection(original_direction)  # 방향 보존
     res.SetOutputOrigin(original_origin)  # 원점 보존
+    res.SetOutputPixelType(sitk.sitkFloat32)  # Float32로 명시적 변환
     
     resampled = res.Execute(img)
     
@@ -86,6 +87,50 @@ def to_isotropic(img: sitk.Image, iso: float = 1.0) -> sitk.Image:
     logger.debug(f"Direction preserved: {np.allclose(np.array(resampled.GetDirection()), np.array(original_direction))}")
     logger.debug(f"Origin preserved: {np.allclose(np.array(resampled.GetOrigin()), np.array(original_origin))}")
     
+    return resampled
+
+
+def resample_to_spacing(img: sitk.Image, target_spacing: tuple, order: int = 1) -> sitk.Image:
+    """
+    지정된 간격으로 리샘플링 (준등방/등방 지원)
+    
+    Args:
+        img: 입력 SimpleITK Image
+        target_spacing: 목표 간격 (x, y, z) 또는 (z, y, x) - SimpleITK는 (x,y,z)
+        order: 보간 차수 (0=Nearest, 1=Linear, 3=BSpline)
+        
+    Returns:
+        sitk.Image: 리샘플된 이미지
+    """
+    original_direction = img.GetDirection()
+    original_origin = img.GetOrigin()
+    original_spacing = img.GetSpacing()
+    
+    # SimpleITK spacing은 (x, y, z) 순서
+    if len(target_spacing) == 3:
+        new_sp = list(target_spacing)
+    else:
+        raise ValueError(f"target_spacing must be 3-tuple, got {target_spacing}")
+    
+    size = img.GetSize()
+    spacing = img.GetSpacing()
+    new_sz = [int(round(s * z / p)) for s, z, p in zip(size, spacing, new_sp)]
+    
+    res = sitk.ResampleImageFilter()
+    if order == 0:
+        res.SetInterpolator(sitk.sitkNearestNeighbor)
+    elif order == 1:
+        res.SetInterpolator(sitk.sitkLinear)
+    else:
+        res.SetInterpolator(sitk.sitkBSpline)
+    
+    res.SetOutputSpacing(new_sp)
+    res.SetSize(new_sz)
+    res.SetOutputDirection(original_direction)
+    res.SetOutputOrigin(original_origin)
+    res.SetOutputPixelType(sitk.sitkFloat32)
+    
+    resampled = res.Execute(img)
     return resampled
 
 

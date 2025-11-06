@@ -636,8 +636,8 @@ def process_dicom_to_mesh(reconstruction: Reconstruction, db: Session) -> dict:
         reconstruction=reconstruction,
         db=db,
         tissues=['bone'],  # 기본값: 뼈만 (근육 추가 시 ['bone', 'muscle'])
-        use_multi_plane=True,  # 다평면 정합 활성화
-        target_spacing=1.0  # 등방성 간격
+        use_multi_plane=False,  # 기본값: 단일 시리즈 우선 (안정적, 가이드 권장)
+        target_spacing=1.2  # 등방성 간격 (1.0-1.2mm 권장)
     )
 
 
